@@ -35,6 +35,7 @@ android {
     }
     buildFeatures {
         compose = true
+        buildConfig = true
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.1"
@@ -44,12 +45,48 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("generated/lp2ln/jniLibs"))
+}
+
+val rustDirectory = rootProject.layout.projectDirectory.dir("rust")
+val rustJniDirectory = layout.buildDirectory.dir("generated/lp2ln/jniLibs")
+
+fun registerRustBuild(name: String, release: Boolean) = tasks.register<Exec>(name) {
+    group = "build"
+    description = "Builds the LP2LN Rust bridge for Android ABIs"
+    workingDir(rustDirectory)
+    environment("CARGO_TARGET_DIR", layout.buildDirectory.dir("rust-target").get().asFile.absolutePath)
+    val args = mutableListOf(
+        "cargo", "ndk",
+        "-t", "arm64-v8a",
+        "-t", "armeabi-v7a",
+        "-t", "x86_64",
+        "-o", rustJniDirectory.get().asFile.absolutePath,
+        "build",
+    )
+    if (release) args += "--release"
+    commandLine(args)
+    inputs.dir(rustDirectory)
+    outputs.dir(rustJniDirectory)
+    onlyIf { !providers.gradleProperty("skipRustBuild").isPresent }
+}
+
+val buildRustDebug = registerRustBuild("buildRustDebug", release = false)
+val buildRustRelease = registerRustBuild("buildRustRelease", release = true)
+
+tasks.matching { it.name == "mergeDebugJniLibFolders" }.configureEach {
+    dependsOn(buildRustDebug)
+}
+tasks.matching { it.name == "mergeReleaseJniLibFolders" }.configureEach {
+    dependsOn(buildRustRelease)
 }
 
 dependencies {
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.activity.compose)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.ui)
