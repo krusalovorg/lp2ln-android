@@ -8,5 +8,8 @@
         <item name="android:navigationBarColor">@color/lp2ln_ink</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:windowSplashScreenBackground">@color/lp2ln_ink</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">@color/lp2ln_ink</item>
     </style>
 </resources>

@@ -138,15 +138,15 @@ private fun BrandHeader() {
         Column {
             Text(
                 text = "LP2LN",
-                fontSize = 20.sp,
+                fontSize = 21.sp,
                 fontWeight = FontWeight.Bold,
-                letterSpacing = 2.sp,
+                letterSpacing = 3.2.sp,
             )
             Text(
-                text = "DECENTRALIZED STORAGE",
+                text = "LIGHT PROTOCOL FOR LAYERED NETWORK",
                 color = TextSecondary,
-                fontSize = 9.sp,
-                letterSpacing = 1.4.sp,
+                fontSize = 7.sp,
+                letterSpacing = 1.05.sp,
             )
         }
     }
@@ -171,20 +171,16 @@ private fun Lp2lnMark(modifier: Modifier = Modifier) {
         top.zipWithNext().forEach { (start, end) ->
             drawLine(gradient, start, end, stroke, StrokeCap.Round)
         }
-        drawLine(
-            gradient,
-            Offset(size.width * .18f, size.height * .65f),
-            Offset(size.width * .50f, size.height * .86f),
-            stroke,
-            StrokeCap.Round,
+        val bottom = listOf(
+            Offset(size.width * .18f, size.height * .62f),
+            Offset(size.width * .18f, size.height * .70f),
+            Offset(size.width * .50f, size.height * .90f),
+            Offset(size.width * .82f, size.height * .70f),
+            Offset(size.width * .82f, size.height * .62f),
         )
-        drawLine(
-            gradient,
-            Offset(size.width * .50f, size.height * .86f),
-            Offset(size.width * .82f, size.height * .65f),
-            stroke,
-            StrokeCap.Round,
-        )
+        bottom.zipWithNext().forEach { (start, end) ->
+            drawLine(gradient, start, end, stroke, StrokeCap.Round)
+        }
         drawCircle(ElectricBlue, radius = stroke * .9f, center = Offset(size.width * .50f, size.height * .56f))
         drawCircle(Violet, radius = stroke * .78f, center = Offset(size.width * .82f, size.height * .65f))
     }
