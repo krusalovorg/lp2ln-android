@@ -1,0 +1,3 @@
+# ponytail: local override while the build.rs cross-compile fix is unpushed.
+# Delete once rust/Cargo.toml points at a lp2ln rev that contains it.
+paths = ["E:/VHP/P2P-Server/crates/lp2ln-core-v2"]

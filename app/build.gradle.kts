@@ -49,6 +49,14 @@ android {
     sourceSets["main"].jniLibs.srcDir(layout.buildDirectory.dir("generated/lp2ln/jniLibs"))
 }
 
+// ponytail: cargo is often not on Gradle's PATH (rustup installs to ~/.cargo/bin)
+val cargoExecutable: String = run {
+    val exe = if (System.getProperty("os.name").startsWith("Windows")) "cargo.exe" else "cargo"
+    val home = System.getenv("CARGO_HOME") ?: "${System.getProperty("user.home")}/.cargo"
+    val local = File(home, "bin/$exe")
+    if (local.exists()) local.absolutePath else "cargo"
+}
+
 val rustDirectory = rootProject.layout.projectDirectory.dir("rust")
 val rustJniDirectory = layout.buildDirectory.dir("generated/lp2ln/jniLibs")
 
@@ -58,7 +66,7 @@ fun registerRustBuild(name: String, release: Boolean) = tasks.register<Exec>(nam
     workingDir(rustDirectory)
     environment("CARGO_TARGET_DIR", layout.buildDirectory.dir("rust-target").get().asFile.absolutePath)
     val args = mutableListOf(
-        "cargo", "ndk",
+        cargoExecutable, "ndk",
         "-t", "arm64-v8a",
         "-t", "armeabi-v7a",
         "-t", "x86_64",

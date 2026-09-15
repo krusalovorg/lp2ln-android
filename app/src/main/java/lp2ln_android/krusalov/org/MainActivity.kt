@@ -17,21 +17,26 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.weight
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Divider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -42,9 +47,12 @@ import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.lifecycle.viewmodel.compose.viewModel
 import java.util.Locale
 import lp2ln_android.krusalov.org.network.ConnectionPhase
@@ -83,11 +91,11 @@ private fun NetworkRoute(viewModel: NetworkViewModel = viewModel()) {
     LaunchedEffect(Unit) {
         viewModel.connect(context.filesDir)
     }
-    NetworkScreen(state = state, onRetry = viewModel::retry)
+    NetworkScreen(state = state, onRetry = viewModel::retry, onReconnect = viewModel::reconnect)
 }
 
 @Composable
-private fun NetworkScreen(state: NetworkState, onRetry: () -> Unit) {
+private fun NetworkScreen(state: NetworkState, onRetry: () -> Unit, onReconnect: (String) -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -118,15 +126,45 @@ private fun NetworkScreen(state: NetworkState, onRetry: () -> Unit) {
             EmptySessions(state.phase)
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                state.sessions.forEach(::SessionRow)
+                state.sessions.forEach { SessionRow(it) }
             }
         }
         Spacer(Modifier.height(20.dp))
-        Text(
-            text = "Bootstrap  ·  ${state.bootstrapAddress}",
-            color = TextSecondary,
-            fontSize = 12.sp,
+        BootstrapCard(state.bootstrapAddress, onReconnect)
+    }
+}
+
+@Composable
+private fun BootstrapCard(current: String, onReconnect: (String) -> Unit) {
+    var address by remember(current) { mutableStateOf(current) }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(18.dp))
+            .padding(18.dp),
+    ) {
+        Text("Bootstrap-узел", color = TextSecondary, fontSize = 12.sp)
+        Spacer(Modifier.height(10.dp))
+        OutlinedTextField(
+            value = address,
+            onValueChange = { address = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            placeholder = { Text("хост:порт", fontSize = 14.sp) },
+            keyboardOptions = KeyboardOptions(
+                keyboardType = KeyboardType.Uri,
+                imeAction = ImeAction.Done,
+            ),
+            keyboardActions = KeyboardActions(onDone = { onReconnect(address) }),
         )
+        Spacer(Modifier.height(10.dp))
+        Button(
+            onClick = { onReconnect(address) },
+            enabled = address.isNotBlank() && address.trim() != current,
+            colors = ButtonDefaults.buttonColors(containerColor = ElectricBlue),
+        ) {
+            Text("Подключиться")
+        }
     }
 }
 
@@ -365,4 +403,51 @@ private fun formatUptime(seconds: Long): String = when {
     seconds >= 3_600 -> "${seconds / 3_600} ч"
     seconds >= 60 -> "${seconds / 60} мин"
     else -> "$seconds с"
+}
+
+// ponytail: превью прямо в MainActivity — файл и так один, отдельный Previews.kt не нужен.
+@Preview(name = "Connected", showBackground = true, backgroundColor = 0xFF0B0D10)
+@Composable
+private fun NetworkScreenConnectedPreview() {
+    Lp2lnandroidTheme {
+        NetworkScreen(
+            state = NetworkState(
+                phase = ConnectionPhase.CONNECTED,
+                peerId = "12D3KooWJk8sT4rQx9vB2mNpLcH7dZfYaR3uE6gW1nXqVtSm",
+                activePeers = 4,
+                activeConnections = 6,
+                bytesSent = 12_483_221,
+                bytesReceived = 48_920_004,
+                uptimeSeconds = 7_412,
+                sessions = List(3) {
+                    NetworkSession(
+                        peerId = "12D3KooWPeer${it}xQ9vB2mNpLcH7dZfYaR3uE6gW1nXq",
+                        protocol = "tcp",
+                        isActive = it != 2,
+                        bytesSent = 102_400L * (it + 1),
+                        bytesReceived = 884_000L * (it + 1),
+                        lastActivitySeconds = it * 17L,
+                    )
+                },
+            ),
+            onRetry = {},
+            onReconnect = {},
+        )
+    }
+}
+
+@Preview(name = "Searching", showBackground = true, backgroundColor = 0xFF0B0D10)
+@Composable
+private fun NetworkScreenSearchingPreview() {
+    Lp2lnandroidTheme {
+        NetworkScreen(NetworkState(phase = ConnectionPhase.SEARCHING, peerId = "12D3KooWJk8sT4rQx9vB2mNpLcH7dZfYa"), {}, {})
+    }
+}
+
+@Preview(name = "Error", showBackground = true, backgroundColor = 0xFF0B0D10)
+@Composable
+private fun NetworkScreenErrorPreview() {
+    Lp2lnandroidTheme {
+        NetworkScreen(NetworkState(phase = ConnectionPhase.ERROR, error = "native library unavailable"), {}, {})
+    }
 }

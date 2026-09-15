@@ -1,0 +1,41 @@
+{
+  "schema_version": 2,
+  "listens": {
+    "tcp": "0.0.0.0:18080",
+    "udp": "0.0.0.0:18180"
+  },
+  "advertise_addrs": null,
+  "default_nodes": [],
+  "bootstrap_nodes": [],
+  "private_key_hex": null,
+  "allow_unsigned_packets": false,
+  "node_role": "regular",
+  "topology_profile": "balanced",
+  "peer_connection_policy": {
+    "min_active_peers": 1,
+    "target_active_peers": 6,
+    "max_active_peers": 14
+  },
+  "lan_discovery": { "enabled": true },
+  "experimental": {
+    "dht": true,
+    "content": true,
+    "repair": false,
+    "app_plane": true
+  },
+  "app_plane_ipc": {
+    "dev_tcp_bind": "127.0.0.1:17999",
+    "app_token": null,
+    "allowed_protocol_ids": []
+  },
+  "logger_options": {
+    "log_dir": "./logs",
+    "file_enabled": true,
+    "show_debug": false,
+    "show_info": true,
+    "show_warning": true,
+    "show_error": true
+  },
+  "database_dir": "./db",
+  "debug_server": { "enabled": false, "bind_addr": "127.0.0.1:9090", "push_interval_ms": 1000 }
+}

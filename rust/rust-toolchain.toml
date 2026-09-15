@@ -1,0 +1,9 @@
+# ponytail: the machine default is pinned to an old rustc; this scopes the
+# Android build to stable without touching other projects.
+[toolchain]
+channel = "stable"
+targets = [
+    "aarch64-linux-android",
+    "armv7-linux-androideabi",
+    "x86_64-linux-android",
+]

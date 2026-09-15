@@ -13,3 +13,12 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# node runtime artifacts (keep binaries + configs only)
+/node/*/db/
+/node/*/logs/
+/node/*/MagicFolder/
+/node/*/*.pdb
+/node/*/*.d
+/node/*/options.last-known-good.json
+/node/*/options.recovery.journal.jsonl

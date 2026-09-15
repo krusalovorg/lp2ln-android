@@ -175,7 +175,7 @@ pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridg
     data_directory: JString,
     bootstrap_address: JString,
 ) -> jstring {
-    let args = (|| {
+    let args: Result<(String, String)> = (|| {
         Ok((
             read_string(&mut env, data_directory)?,
             read_string(&mut env, bootstrap_address)?,
