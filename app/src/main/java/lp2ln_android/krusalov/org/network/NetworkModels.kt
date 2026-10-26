@@ -33,7 +33,7 @@ data class NetworkState(
     val transfer: FileTransfer = FileTransfer(),
 ) {
     companion object {
-        const val DEFAULT_BOOTSTRAP = "83.136.233.187:18080"
+        val DEFAULT_BOOTSTRAP: String = lp2ln_android.krusalov.org.BuildConfig.LP2LN_BOOTSTRAP
     }
 }
 

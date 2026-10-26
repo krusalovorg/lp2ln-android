@@ -14,6 +14,14 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        // Inject a private endpoint at build time; never commit deployment addresses.
+        val bootstrap = providers.gradleProperty("lp2lnBootstrap")
+            .orElse(providers.environmentVariable("LP2LN_BOOTSTRAP"))
+            .getOrElse("")
+        require(bootstrap.none { it == '"' || it == '\\' || it.isISOControl() }) {
+            "Invalid lp2lnBootstrap value"
+        }
+        buildConfigField("String", "LP2LN_BOOTSTRAP", "\"$bootstrap\"")
         ndk {
             abiFilters += providers.gradleProperty("rustAbis")
                 .getOrElse("arm64-v8a,armeabi-v7a,x86_64").split(",").map { it.trim() }

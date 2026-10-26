@@ -124,7 +124,12 @@ class NetworkViewModel(
             ?.runCatching { readText().trim() }
             ?.getOrNull()
             ?.takeIf { it.isNotEmpty() }
-        launchNode(stored ?: _state.value.bootstrapAddress, restart = false)
+        val bootstrap = stored ?: _state.value.bootstrapAddress
+        if (bootstrap.isBlank()) {
+            _state.value = NetworkState(phase = ConnectionPhase.STOPPED)
+            return
+        }
+        launchNode(bootstrap, restart = false)
     }
 
     /** Switches the node to a user-supplied bootstrap node and remembers it. */
@@ -134,7 +139,7 @@ class NetworkViewModel(
         if (dataDirectory == null) return
         if (!isValidBootstrap(bootstrap)) {
             _state.value = _state.value.copy(
-                error = "Неверный адрес. Формат: хост:порт, например 83.136.233.187:18080",
+                error = "Неверный адрес. Используйте формат хост:порт.",
             )
             return
         }
