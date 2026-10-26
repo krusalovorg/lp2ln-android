@@ -14,4 +14,6 @@ internal object Lp2lnNativeBridge {
     external fun nativeStart(dataDirectory: String, bootstrapAddress: String): String
     external fun nativeSnapshot(): String
     external fun nativeStop(): String
+    external fun nativeUpload(path: String, name: String, retryId: String): String
+    external fun nativeExport(id: String, destination: String): String
 }

@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "lp2ln_android.krusalov.org"
     compileSdk = 34
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
         applicationId = "lp2ln_android.krusalov.org"
@@ -13,6 +14,10 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
+        ndk {
+            abiFilters += providers.gradleProperty("rustAbis")
+                .getOrElse("arm64-v8a,armeabi-v7a,x86_64").split(",").map { it.trim() }
+        }
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -67,15 +72,17 @@ fun registerRustBuild(name: String, release: Boolean) = tasks.register<Exec>(nam
     environment("CARGO_TARGET_DIR", layout.buildDirectory.dir("rust-target").get().asFile.absolutePath)
     val args = mutableListOf(
         cargoExecutable, "ndk",
-        "-t", "arm64-v8a",
-        "-t", "armeabi-v7a",
-        "-t", "x86_64",
+        *providers.gradleProperty("rustAbis").getOrElse("arm64-v8a,armeabi-v7a,x86_64")
+            .split(",").flatMap { listOf("-t", it.trim()) }.toTypedArray(),
         "-o", rustJniDirectory.get().asFile.absolutePath,
         "build",
     )
     if (release) args += "--release"
     commandLine(args)
-    inputs.dir(rustDirectory)
+    inputs.files(fileTree(rustDirectory) {
+        include("src/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/**")
+    })
+    inputs.property("rustAbis", providers.gradleProperty("rustAbis").getOrElse("arm64-v8a,armeabi-v7a,x86_64"))
     outputs.dir(rustJniDirectory)
     onlyIf { !providers.gradleProperty("skipRustBuild").isPresent }
 }

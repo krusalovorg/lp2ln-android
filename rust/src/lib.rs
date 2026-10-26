@@ -1,4 +1,5 @@
-use std::net::SocketAddr;
+mod files;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -18,11 +19,12 @@ struct NativeNode {
     runtime: Runtime,
     node: NodeRuntime,
     started_at: Instant,
+    data_directory: String,
 }
 
-static NODE: OnceLock<Mutex<Option<NativeNode>>> = OnceLock::new();
+static NODE: OnceLock<Mutex<Option<Arc<NativeNode>>>> = OnceLock::new();
 
-fn node_slot() -> &'static Mutex<Option<NativeNode>> {
+fn node_slot() -> &'static Mutex<Option<Arc<NativeNode>>> {
     NODE.get_or_init(|| Mutex::new(None))
 }
 
@@ -36,8 +38,9 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
     }
 
     let bootstrap: SocketAddr = bootstrap_address
-        .parse()
-        .with_context(|| format!("invalid bootstrap address: {bootstrap_address}"))?;
+        .to_socket_addrs()
+        .with_context(|| format!("invalid bootstrap address: {bootstrap_address}"))?
+        .find(|address| address.is_ipv4()).context("Bootstrap has no IPv4 address")?;
     let database = Arc::new(
         P2PDatabase::new(&data_directory).context("failed to open LP2LN database")?,
     );
@@ -51,6 +54,8 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
             max_active_peers: 8,
         })
         .allow_unsigned_packets(false);
+    options.experimental.content = true;
+    options.experimental.dht = true;
     options.logger_options = None;
     options.lan_discovery.enabled = true;
     options.debug_server.enabled = false;
@@ -72,11 +77,12 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
         .block_on(node.start())
         .context("failed to start LP2LN node")?;
 
-    let native = NativeNode {
+    let native = Arc::new(NativeNode {
         runtime,
         node,
         started_at: Instant::now(),
-    };
+        data_directory,
+    });
     let result = snapshot(&native);
     *slot = Some(native);
     Ok(result)
@@ -123,6 +129,7 @@ fn snapshot(native: &NativeNode) -> Value {
         "degraded": health.mode == RuntimeMode::Degraded,
         "lastError": health.last_error.unwrap_or_default(),
         "sessions": session_values,
+        "storage": files::state(native),
     })
 }
 
@@ -201,4 +208,19 @@ pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridg
     _class: JClass,
 ) -> jstring {
     return_json(&mut env, stop_node)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeUpload(
+    mut env: JNIEnv, _class: JClass, path: JString, name: JString, retry_id: JString,
+) -> jstring {
+    let args: Result<_> = (|| Ok((read_string(&mut env, path)?, read_string(&mut env, name)?, read_string(&mut env, retry_id)?)))();
+    return_json(&mut env, || { let (path, name, retry_id) = args?; files::begin(path, name, retry_id) })
+}
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeExport(
+    mut env: JNIEnv, _class: JClass, id: JString, destination: JString,
+) -> jstring {
+    let args: Result<_> = (|| Ok((read_string(&mut env, id)?, read_string(&mut env, destination)?)))();
+    return_json(&mut env, || { let (id, destination) = args?; files::export(id, destination) })
 }

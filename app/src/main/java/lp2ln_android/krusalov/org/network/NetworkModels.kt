@@ -29,8 +29,19 @@ data class NetworkState(
     val bootstrapAddress: String = DEFAULT_BOOTSTRAP,
     val sessions: List<NetworkSession> = emptyList(),
     val error: String? = null,
+    val files: List<StoredFile> = emptyList(),
+    val transfer: FileTransfer = FileTransfer(),
 ) {
     companion object {
         const val DEFAULT_BOOTSTRAP = "83.136.233.187:18080"
     }
 }
+
+data class StoredFile(
+    val id: String, val name: String, val size: Long, val uploaded: Boolean,
+    val replicas: Int, val error: String? = null,
+)
+data class FileTransfer(
+    val busy: Boolean = false, val name: String = "", val stage: String = "",
+    val done: Long = 0, val total: Long = 0, val error: String? = null,
+)

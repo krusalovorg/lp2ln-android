@@ -1,5 +1,11 @@
 package lp2ln_android.krusalov.org.network
 
+import android.content.Context
+import android.net.Uri
+import android.provider.OpenableColumns
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import java.io.File
@@ -19,6 +25,92 @@ class NetworkViewModel(
     private val _state = MutableStateFlow(NetworkState())
     val state: StateFlow<NetworkState> = _state.asStateFlow()
 
+    private val nodeMutex = Mutex()
+    private val _fileBusy = MutableStateFlow(false)
+    val fileBusy = _fileBusy.asStateFlow()
+    private val _notice = MutableStateFlow<String?>(null)
+    val notice = _notice.asStateFlow()
+    fun clearNotice() { _notice.value = null }
+
+    fun importFile(context: Context, uri: Uri) {
+        if (_fileBusy.value || _state.value.transfer.busy) return
+        _fileBusy.value = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    val directory = File(requireNotNull(dataDirectory), "imports").also { it.mkdirs() }
+                    val staging = File.createTempFile("upload-", ".bin", directory)
+                    var handedOff = false
+                    try {
+                        val name = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                            ?.use { if (it.moveToFirst()) it.getString(0) else null } ?: "File"
+                        context.contentResolver.openInputStream(uri)?.use { input ->
+                            staging.outputStream().use { output ->
+                                val buffer = ByteArray(64 * 1024)
+                                var total = 0L
+                                while (true) {
+                                    val count = input.read(buffer)
+                                    if (count < 0) break
+                                    total += count
+                                    check(total <= 100L * 1024 * 1024) { "Максимальный размер файла — 100 МБ" }
+                                    output.write(buffer, 0, count)
+                                }
+                            }
+                        } ?: error("Не удалось прочитать файл")
+                        nodeMutex.withLock {
+                            repository.upload(staging.absolutePath, name)
+                            handedOff = true
+                            _state.value = repository.snapshot(_state.value.bootstrapAddress)
+                        }
+                    } finally { if (!handedOff) staging.delete() }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message ?: "Не удалось добавить файл"
+            } finally { _fileBusy.value = false }
+        }
+    }
+
+    fun retryFile(file: StoredFile) {
+        if (_fileBusy.value || _state.value.transfer.busy) return
+        _fileBusy.value = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    nodeMutex.withLock {
+                        repository.upload("", file.name, file.id)
+                        _state.value = repository.snapshot(_state.value.bootstrapAddress)
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message
+            } finally { _fileBusy.value = false }
+        }
+    }
+
+    fun exportFile(context: Context, file: StoredFile, uri: Uri) {
+        if (_fileBusy.value) return
+        _fileBusy.value = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    val temp = File.createTempFile("restore-", ".bin", context.cacheDir)
+                    try {
+                        repository.export(file.id, temp.absolutePath)
+                        context.contentResolver.openOutputStream(uri, "wt")?.use { output ->
+                            temp.inputStream().use { it.copyTo(output) }
+                        } ?: error("Не удалось сохранить файл")
+                    } finally { temp.delete() }
+                }
+                _notice.value = "Файл сохранён"
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message
+            } finally { _fileBusy.value = false }
+        }
+    }
+
     private var dataDirectory: File? = null
     private var bootstrapFile: File? = null
     private var pollingJob: Job? = null
@@ -37,11 +129,11 @@ class NetworkViewModel(
 
     /** Switches the node to a user-supplied bootstrap node and remembers it. */
     fun reconnect(address: String) {
+        if (_fileBusy.value || _state.value.transfer.busy) return
         val bootstrap = address.trim()
         if (dataDirectory == null) return
         if (!isValidBootstrap(bootstrap)) {
             _state.value = _state.value.copy(
-                phase = ConnectionPhase.ERROR,
                 error = "Неверный адрес. Формат: хост:порт, например 83.136.233.187:18080",
             )
             return
@@ -50,15 +142,18 @@ class NetworkViewModel(
         launchNode(bootstrap, restart = true)
     }
 
-    fun retry() = launchNode(_state.value.bootstrapAddress, restart = true)
+    fun retry() { if (!_fileBusy.value && !_state.value.transfer.busy) launchNode(_state.value.bootstrapAddress, restart = true) }
 
     private fun launchNode(bootstrap: String, restart: Boolean) {
+        if (dataDirectory == null) return
         pollingJob?.cancel()
         _state.value = NetworkState(phase = ConnectionPhase.STARTING, bootstrapAddress = bootstrap)
         pollingJob = viewModelScope.launch {
             _state.value = withContext(Dispatchers.IO) {
-                if (restart) repository.stop()
-                repository.start(requireNotNull(dataDirectory), bootstrap)
+                nodeMutex.withLock {
+                    if (restart) repository.stop()
+                    repository.start(requireNotNull(dataDirectory), bootstrap)
+                }
             }
             if (_state.value.phase == ConnectionPhase.ERROR) return@launch
 

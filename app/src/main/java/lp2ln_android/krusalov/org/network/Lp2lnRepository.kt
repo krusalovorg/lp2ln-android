@@ -4,6 +4,19 @@ import java.io.File
 import org.json.JSONObject
 
 class Lp2lnRepository {
+
+    fun upload(path: String, name: String, retryId: String = "") {
+        check(Lp2lnNativeBridge.isAvailable) { Lp2lnNativeBridge.unavailableReason }
+        val result = JSONObject(Lp2lnNativeBridge.nativeUpload(path, name, retryId))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
+    fun export(id: String, destination: String) {
+        check(Lp2lnNativeBridge.isAvailable) { Lp2lnNativeBridge.unavailableReason }
+        val result = JSONObject(Lp2lnNativeBridge.nativeExport(id, destination))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
     fun start(dataDirectory: File, bootstrapAddress: String): NetworkState {
         if (!Lp2lnNativeBridge.isAvailable) {
             return NetworkState(
@@ -70,7 +83,23 @@ class Lp2lnRepository {
             lifecycle == "stopped" -> ConnectionPhase.STOPPED
             else -> ConnectionPhase.STARTING
         }
+
+        val storage = json.optJSONObject("storage")
+        val filesJson = storage?.optJSONArray("files")
+        val files = buildList {
+            if (filesJson != null) for (index in 0 until filesJson.length()) {
+                val file = filesJson.getJSONObject(index)
+                add(StoredFile(file.getString("id"), file.getString("name"), file.getLong("size"),
+                    file.optString("status") == "uploaded", file.optInt("replicas"),
+                    file.optString("error").takeUnless { it.isBlank() || it == "null" }))
+            }
+        }
+        val transfer = storage?.optJSONObject("transfer") ?: JSONObject()
         NetworkState(
+            files = files,
+            transfer = FileTransfer(transfer.optBoolean("busy"), transfer.optString("name"),
+                transfer.optString("stage"), transfer.optLong("done"), transfer.optLong("total"),
+                transfer.optString("error").takeUnless { it.isBlank() || it == "null" }),
             phase = phase,
             peerId = json.optString("peerId"),
             activePeers = activePeers,
