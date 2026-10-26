@@ -267,7 +267,9 @@ private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Un
             InfoRow("Время работы", formatUptime(state.uptimeSeconds))
             state.error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 13.sp) }
             if (state.phase == ConnectionPhase.ERROR || state.phase == ConnectionPhase.STOPPED)
-                TextButton(onClick = onRetry, enabled = !busy) { Text("Подключиться") }
+                TextButton(onClick = {
+                    if (state.bootstrapAddress.isBlank()) editing = true else onRetry()
+                }, enabled = !busy) { Text("Подключиться") }
         }
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("Подключение", color = Secondary, fontSize = 13.sp, modifier = Modifier.padding(start = 16.dp))

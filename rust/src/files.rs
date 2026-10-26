@@ -267,4 +267,51 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // Opt-in live deployment check. The endpoint is supplied locally, never committed.
+    #[test]
+    #[ignore = "requires LP2LN_TEST_BOOTSTRAP and uploads a generated test file"]
+    fn remote_node_upload_and_restore() {
+        let bootstrap = std::env::var("LP2LN_TEST_BOOTSTRAP").expect("Set LP2LN_TEST_BOOTSTRAP");
+        let root = std::env::temp_dir().join(format!("lp2ln-remote-test-{}", content_id_hex(&generate_key())));
+        fs::create_dir_all(&root).unwrap();
+        crate::start_node(root.join("node").to_string_lossy().into_owned(), bootstrap).unwrap();
+        let native = get_native().unwrap();
+        native.runtime.block_on(async {
+            for _ in 0..120 {
+                if native.node.active_peer_count() > 0 { return; }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            panic!("Remote bootstrap did not establish a peer session");
+        });
+        let source = (0..CHUNK_SIZE + 73).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let path = root.join("deployment-check.bin");
+        fs::write(&path, &source).unwrap();
+        let entry = import(&native, path.to_str().unwrap(), "deployment-check.bin").unwrap();
+        let uploaded = publish(&native, entry).unwrap();
+        let id = content_id_from_hex(uploaded["id"].as_str().unwrap()).unwrap();
+        let key = content_id_from_hex(uploaded["key"].as_str().unwrap()).unwrap();
+        let peer = uploaded["peer"].as_str().unwrap();
+        let service = native.node.block_transfer_service().unwrap();
+        let restored = native.runtime.block_on(async {
+            // Explicitly fetch from the remote peer, bypassing the local block store.
+            let encrypted = service.fetch_from(peer, id).await.unwrap();
+            let manifest = FileManifest::decode(&decrypt_chunk(&key, 0, &encrypted).unwrap()).unwrap();
+            let mut restored = vec![];
+            for (index, id) in manifest.chunk_ids.iter().enumerate() {
+                let block = service.fetch_from(peer, *id).await.unwrap();
+                restored.extend(decrypt_chunk(&manifest.file_key, index as u32, &block).unwrap());
+            }
+            restored
+        });
+        assert_eq!(restored, source);
+        let output = root.join("restored.bin");
+        export(uploaded["id"].as_str().unwrap().to_owned(), output.to_string_lossy().into_owned()).unwrap();
+        assert_eq!(fs::read(output).unwrap(), source);
+        println!("Remote upload, remote fetch and local export verified: {} bytes", source.len());
+        crate::stop_node().unwrap();
+        drop(service);
+        drop(native);
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }
