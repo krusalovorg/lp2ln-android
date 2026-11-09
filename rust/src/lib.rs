@@ -276,7 +276,12 @@ pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridg
         let native = files::get_native()?;
         let capability = files::share_capability(&native, &id)?;
         files::progress(json!({"busy":true,"name":capability["name"],"stage":"Отправка ключа","done":0,"total":0}));
-        let result = native.runtime.block_on(sharing::send(&native.node, &recipient, capability));
+        let result = native.runtime.block_on(async {
+            // This supplements existing UDP connectivity without requiring the
+            // user to switch transports in settings.
+            let _ = files::ensure_file_path(&native, &[recipient.clone()]).await;
+            sharing::send(&native.node, &recipient, capability).await
+        });
         files::progress(json!({"busy":false}));
         result
     })

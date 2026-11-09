@@ -1125,7 +1125,7 @@ dependencies = [
 [[package]]
 name = "lp2ln-app-protocol"
 version = "0.1.0"
-source = "git+https://github.com/krusalovorg/lp2ln.git?rev=393f319ea0603a045d8b0cceb6feb349046942de#393f319ea0603a045d8b0cceb6feb349046942de"
+source = "git+https://github.com/krusalovorg/lp2ln.git?rev=65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc#65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc"
 dependencies = [
  "postcard",
  "serde",
@@ -1134,7 +1134,7 @@ dependencies = [
 [[package]]
 name = "lp2ln-content"
 version = "0.1.0"
-source = "git+https://github.com/krusalovorg/lp2ln.git?rev=393f319ea0603a045d8b0cceb6feb349046942de#393f319ea0603a045d8b0cceb6feb349046942de"
+source = "git+https://github.com/krusalovorg/lp2ln.git?rev=65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc#65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc"
 dependencies = [
  "chacha20poly1305",
  "hex",
@@ -1150,7 +1150,7 @@ dependencies = [
 [[package]]
 name = "lp2ln-core-v2"
 version = "0.0.2"
-source = "git+https://github.com/krusalovorg/lp2ln.git?rev=393f319ea0603a045d8b0cceb6feb349046942de#393f319ea0603a045d8b0cceb6feb349046942de"
+source = "git+https://github.com/krusalovorg/lp2ln.git?rev=65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc#65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc"
 dependencies = [
  "anyhow",
  "async-std",

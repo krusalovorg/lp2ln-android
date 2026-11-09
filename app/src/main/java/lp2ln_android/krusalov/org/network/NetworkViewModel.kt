@@ -181,7 +181,9 @@ class NetworkViewModel(
                 _notice.value = "Файл получен. Его можно открыть."
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                _notice.value = error.message ?: "Не удалось скачать файл"
+                _notice.value = if (error.message.orEmpty().contains("no valid provider"))
+                    "Источники файла не ответили. Повторите загрузку после подключения."
+                    else error.message ?: "Не удалось скачать файл"
             } finally { _fileBusy.value = false }
         }
     }

@@ -78,6 +78,42 @@ pub(crate) fn get_native() -> Result<Arc<NativeNode>> {
         .as_ref().cloned().context("Сначала подключитесь к сети")
 }
 
+// Keep protocol selection automatic. UDP discovery may be healthy while no TCP
+// data link exists; open one on demand using authenticated, cached addresses.
+pub(crate) async fn ensure_file_path(native: &NativeNode, providers: &[String]) -> Result<()> {
+    let reliable = |protocol: &str| matches!(protocol, "tcp" | "quic" | "tunnel_tcp" | "relay");
+    let sessions = native.node.debug_sessions();
+    if sessions.iter().any(|s| s.is_active && reliable(&s.protocol)
+        && s.peer_id.as_ref().is_some_and(|peer| providers.contains(peer))) { return Ok(()); }
+    let mut targets = {
+        let mut book = native.known_peers.lock().map_err(|_| anyhow::anyhow!("Peer cache unavailable"))?;
+        let _ = book.remember(native.node.peer_catalog().descriptors(), native.node.peer_id());
+        book.targets().into_iter().filter(|t| t.protocols.iter().any(|p| p == "tcp")).collect::<Vec<_>>()
+    };
+    targets.sort_by_key(|t| !t.peer_id_hint.as_ref().is_some_and(|peer| providers.iter().any(|p| p == peer.as_str())));
+    for target in targets.into_iter().take(4) {
+        let Some(expected) = target.peer_id_hint else { continue; };
+        if sessions.iter().any(|s| s.is_active && reliable(&s.protocol) && s.peer_id.as_deref() == Some(expected.as_str())) {
+            return Ok(());
+        }
+        let Ok(Ok(session)) = tokio::time::timeout(std::time::Duration::from_secs(3),
+            native.node.connect("tcp", target.addr)).await else { continue; };
+        for _ in 0..15 {
+            if let Some(connected) = native.node.debug_sessions().into_iter().find(|s| s.session_id == session.as_str()) {
+                if let Some(peer) = connected.peer_id {
+                    if peer == expected.as_str() && connected.is_active { return Ok(()); }
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let _ = native.node.disconnect_session(session.as_str()).await;
+    }
+    anyhow::ensure!(native.node.debug_sessions().iter().any(|s| s.is_active && reliable(&s.protocol)),
+        "Не удалось открыть канал для файла. Проверьте сеть и повторите попытку.");
+    Ok(())
+}
+
 pub(crate) fn share_capability(native: &NativeNode, id: &str) -> Result<Value> {
     let entry = read_index(native)?.into_iter().find(|v| v["id"] == id).context("Файл не найден")?;
     anyhow::ensure!(entry["status"] != "offered", "Сначала скачайте файл");
@@ -102,6 +138,7 @@ pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
         let providers = entry["providers"].as_array().context("Нет источников файла")?
             .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>();
         progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла","done":0,"total":0}));
+        ensure_file_path(native, &providers).await?;
         let sealed = service.fetch_from_providers(manifest_id, &providers).await?;
         let manifest = FileManifest::decode(&decrypt_chunk(&key, 0, &sealed)?)?;
         anyhow::ensure!(manifest.file_size <= MAX_FILE_SIZE && manifest.chunk_ids.len() <= 400,
@@ -131,7 +168,7 @@ pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
     });
     match &result {
         Ok(_) => progress(json!({"busy":false,"stage":"Файл получен"})),
-        Err(error) => progress(json!({"busy":false,"name":entry["name"],"error":format!("{error:#}")})),
+        Err(error) => progress(json!({"busy":false,"fileId":id,"name":entry["name"],"error":format!("{error:#}")})),
     }
     result
 }
@@ -210,6 +247,7 @@ fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
         let service = native.node.block_transfer_service().context("Хранилище недоступно")?;
         let peers = native.node.connected_peers();
         anyhow::ensure!(!peers.is_empty(), "Нет подключённых узлов. Файл сохранён на телефоне — повторите отправку после подключения.");
+        ensure_file_path(native, &peers.iter().map(|p| p.to_string()).collect::<Vec<_>>()).await?;
         let mut ids: Vec<ContentId> = entry["blocks"].as_array().context("Invalid file index")?
             .iter().map(|v| content_id_from_hex(v.as_str().unwrap_or_default()).context("Invalid block ID"))
             .collect::<std::result::Result<_, _>>()?;
@@ -384,7 +422,6 @@ mod tests {
         assert_eq!(inbox[0]["receivedFrom"], sender.node.peer_id());
         assert!(receiver.node.block_transfer_service().unwrap().store.get(
             &content_id_from_hex(id).unwrap()).unwrap().is_none());
-        receiver.runtime.block_on(receiver.node.router().unwrap().teardown_session(&"test-blackhole".into())).unwrap();
         // The sender can close its app after the key is delivered: the remote
         // replica supplies encrypted blocks across the two relay hops.
         stop_test_node(&sender);
@@ -501,6 +538,30 @@ mod tests {
     }
 
     // Opt-in live deployment check. The endpoint is supplied locally, never committed.
+    #[test]
+    #[ignore = "requires LP2LN_TEST_BOOTSTRAP, LP2LN_TEST_PROVIDER and LP2LN_TEST_BLOCK_ID"]
+    fn fetch_existing_encrypted_block_through_live_network() {
+        let root = std::env::temp_dir().join(format!("lp2ln-live-fetch-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        let bootstrap = std::env::var("LP2LN_TEST_BOOTSTRAP").unwrap();
+        let provider = std::env::var("LP2LN_TEST_PROVIDER").unwrap();
+        let id = content_id_from_hex(&std::env::var("LP2LN_TEST_BLOCK_ID").unwrap()).unwrap();
+        crate::start_node(root.to_string_lossy().into_owned(), bootstrap).unwrap();
+        let native = get_native().unwrap();
+        let encrypted = native.runtime.block_on(async {
+            for _ in 0..100 {
+                if native.node.active_peer_count() > 0 { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            native.node.block_transfer_service().unwrap().fetch_from(&provider, id).await.unwrap()
+        });
+        assert!(!encrypted.is_empty());
+        println!("Fetched and hash-verified {} encrypted bytes from the live provider", encrypted.len());
+        crate::stop_node().unwrap();
+        drop(native);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     #[ignore = "requires LP2LN_TEST_BOOTSTRAP and uploads a generated test file"]
     fn remote_node_upload_and_restore() {

@@ -45,6 +45,7 @@ pub(crate) fn fetch(native: &NativeNode, id: &str, destination: &str) -> Result<
         .filter_map(|v| v.as_str().map(str::to_owned)).collect();
     if let Some(peer) = entry["peer"].as_str() { providers.insert(0, peer.to_owned()); }
     native.runtime.block_on(async {
+        crate::files::ensure_file_path(native, &providers).await?;
         let service = native.node.block_transfer_service().context("Storage unavailable")?;
         let id = content_id_from_hex(capability["id"].as_str().unwrap()).unwrap();
         let key = content_id_from_hex(capability["key"].as_str().unwrap()).unwrap();

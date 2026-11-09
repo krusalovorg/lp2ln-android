@@ -172,7 +172,8 @@ private fun NetworkScreen(
                 if (busy || state.transfer.error != null) item {
                     Group {
                         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text(if (busy) state.transfer.stage.ifBlank { "Подготовка…" } else "Не отправлено",
+                            Text(if (busy) state.transfer.stage.ifBlank { "Подготовка…" }
+                                else if (state.transfer.fileId.isNotBlank()) "Не удалось получить файл" else "Не отправлено",
                                 fontSize = 14.sp, fontWeight = FontWeight.Medium)
                             if (busy && state.transfer.total > 0) Text(
                                 "${(state.transfer.done * 100 / state.transfer.total).coerceIn(0, 100)}%",
@@ -185,7 +186,9 @@ private fun NetworkScreen(
                                 (state.transfer.done.toFloat() / state.transfer.total).coerceIn(0f, 1f),
                                 modifier = Modifier.fillMaxWidth(), color = Blue, trackColor = DividerColor)
                             else LinearProgressIndicator(Modifier.fillMaxWidth(), color = Blue, trackColor = DividerColor)
-                        } else Text(state.transfer.error.orEmpty(), color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
+                        } else Text(if (state.transfer.error.orEmpty().contains("no valid provider"))
+                            "Источники файла не ответили. Повторите загрузку после подключения."
+                            else state.transfer.error.orEmpty(), color = MaterialTheme.colorScheme.error, fontSize = 13.sp)
                     }
                 }
                 if (!available) item {
