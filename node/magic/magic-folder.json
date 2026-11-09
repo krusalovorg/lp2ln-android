@@ -1,0 +1,10 @@
+{
+  "root": "./MagicFolder",
+  "db_path": "./magic-folder.db",
+  "poll_interval_secs": 5,
+  "stability_secs": 2,
+  "auto_dehydrate": false,
+  "namespace_id": "2ee5fdf4cb3f4d9edce107d28baa3a9cf23a030ff7517bc8e0e0d43c80c61d40",
+  "namespace_key": "b7823939441fe81302da6957adcdf36255f41038f899bc70d2d6cf841d523934",
+  "node_addr": "127.0.0.1:17999"
+}
