@@ -15,6 +15,7 @@ use crate::{node_slot, NativeNode};
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 // Small blocks also work through peers with conservative packet limits.
 const CHUNK_SIZE: usize = 256 * 1024;
+const DOWNLOAD_CONCURRENCY: usize = 4;
 static TRANSFER: OnceLock<Mutex<Value>> = OnceLock::new();
 fn transfer_slot() -> &'static Mutex<Value> {
     TRANSFER.get_or_init(|| Mutex::new(json!({"busy": false})))
@@ -148,15 +149,58 @@ pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
         progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла",
             "done":0,"total":manifest.chunk_ids.len()}));
         let mut size = 0u64;
-        for (index, block) in manifest.chunk_ids.iter().enumerate() {
-            let encrypted = service.fetch_from_providers(*block, &providers).await?;
-            let plain = decrypt_chunk(&manifest.file_key, index as u32, &encrypted)?;
-            size += plain.len() as u64;
-            anyhow::ensure!(size <= MAX_FILE_SIZE, "Файл превышает допустимый размер");
-            service.store.put(&encrypted)?;
-            progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла",
-                "done":index+1,"total":manifest.chunk_ids.len()}));
+        let mut completed = 0usize;
+        let mut next = 0usize;
+        let mut failure: Option<anyhow::Error> = None;
+        let mut pending = tokio::task::JoinSet::new();
+        let sessions = native.node.debug_sessions();
+        let connected_sources: Vec<String> = providers.iter().filter(|peer| sessions.iter().any(|s|
+            s.is_active && s.peer_id.as_ref() == Some(*peer)
+                && matches!(s.protocol.as_str(), "tcp" | "quic" | "tunnel_tcp" | "relay")))
+            .cloned().collect();
+        // Keep a bounded window full. A slow chunk does not stop requests for
+        // other chunks. Their original indices determine authentication and
+        // the manifest determines export order, regardless of arrival order.
+        loop {
+            while failure.is_none() && next < manifest.chunk_ids.len() && pending.len() < DOWNLOAD_CONCURRENCY {
+                let index = next;
+                let block = manifest.chunk_ids[index];
+                let key = manifest.file_key;
+                let service = service.clone();
+                // Distribute across confirmed data links. An offline original
+                // sender remains a fallback, not a primary for half the chunks.
+                let mut sources = if connected_sources.len() > 1 { connected_sources.clone() }
+                    else { providers.clone() };
+                if connected_sources.len() > 1 {
+                    let offset = index % sources.len();
+                    sources.rotate_left(offset);
+                    for peer in &providers {
+                        if !sources.contains(peer) { sources.push(peer.clone()); }
+                    }
+                }
+                pending.spawn(async move {
+                    let encrypted = service.fetch_from_providers(block, &sources).await?;
+                    let plain = decrypt_chunk(&key, index as u32, &encrypted)?;
+                    anyhow::ensure!(plain.len() <= CHUNK_SIZE, "Часть файла превышает допустимый размер");
+                    Ok::<_, anyhow::Error>((encrypted, plain.len() as u64))
+                });
+                next += 1;
+            }
+            let Some(result) = pending.join_next().await else { break; };
+            let result = result.map_err(anyhow::Error::from).and_then(|r| r).and_then(|(encrypted, length)| {
+                size += length;
+                anyhow::ensure!(size <= MAX_FILE_SIZE, "Файл превышает допустимый размер");
+                service.store.put(&encrypted)?;
+                completed += 1;
+                progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла",
+                    "done":completed,"total":manifest.chunk_ids.len()}));
+                Ok(())
+            });
+            if let Err(error) = result { if failure.is_none() { failure = Some(error); } }
+            // On failure, stop creating requests but drain those already sent.
+            // This lets the block service release its pending reply entries.
         }
+        if let Some(error) = failure { return Err(error); }
         anyhow::ensure!(size == manifest.file_size, "Размер файла не совпадает");
         entry["name"] = json!(manifest.original_name.chars().take(255).collect::<String>());
         entry["size"] = json!(size);
@@ -324,6 +368,10 @@ fn export_from(native: &NativeNode, id: &str, destination: &str) -> Result<Value
 }
 
 #[cfg(test)]
+#[path = "split_node_benchmark.rs"]
+mod split_node_benchmark;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -340,7 +388,7 @@ mod tests {
         fn spawn_reader(self: Arc<Self>, _: tokio::sync::mpsc::Sender<lp2ln_core_v2::sessions::session::IncomingPacket>) {}
     }
 
-    fn test_node(directory: &Path, routed_signatures: bool) -> (NativeNode, std::net::SocketAddr) {
+    pub(super) fn test_node(directory: &Path, routed_signatures: bool) -> (NativeNode, std::net::SocketAddr) {
         use lp2ln_core_v2::{db::P2PDatabase, node::{NodeBuilder, NodeOptions}, transport::tcp::TcpTransport};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -368,7 +416,7 @@ mod tests {
             sharing_task: Mutex::new(Some(task)), bootstrap_warning: None, file_index }, address)
     }
 
-    fn stop_test_node(native: &NativeNode) {
+    pub(super) fn stop_test_node(native: &NativeNode) {
         for task in [&native.discovery_task, &native.sharing_task] {
             if let Some(task) = task.lock().unwrap().take() {
                 task.abort();
@@ -398,7 +446,7 @@ mod tests {
             }
             panic!("Four-node relay topology did not connect");
         });
-        let original = (0..CHUNK_SIZE + 73).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let original = (0..CHUNK_SIZE * 5 + 73).map(|i| (i % 251) as u8).collect::<Vec<_>>();
         let source = root.join("source.bin");
         fs::write(&source, &original).unwrap();
         let thumbnail = [0xff, 0xd8, 1, 2, 3, 4, 0xff, 0xd9];

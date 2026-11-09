@@ -13,8 +13,8 @@ android {
         manifestPlaceholders["appLabel"] = providers.gradleProperty("appLabel").getOrElse("@string/app_name")
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.2.1"
+        versionCode = 5
+        versionName = "1.2.2"
         // Inject a private endpoint at build time; never commit deployment addresses.
         val bootstrap = providers.gradleProperty("lp2lnBootstrap")
             .orElse(providers.environmentVariable("LP2LN_BOOTSTRAP"))
