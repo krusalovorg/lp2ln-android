@@ -6,14 +6,15 @@ plugins {
 android {
     namespace = "lp2ln_android.krusalov.org"
     compileSdk = 34
-    ndkVersion = "27.3.13750724"
+    ndkVersion = providers.gradleProperty("androidNdkVersion").getOrElse("27.3.13750724")
 
     defaultConfig {
-        applicationId = "lp2ln_android.krusalov.org"
+        applicationId = providers.gradleProperty("applicationIdOverride").getOrElse("lp2ln_android.krusalov.org")
+        manifestPlaceholders["appLabel"] = providers.gradleProperty("appLabel").getOrElse("@string/app_name")
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 3
+        versionName = "1.2.0"
         // Inject a private endpoint at build time; never commit deployment addresses.
         val bootstrap = providers.gradleProperty("lp2lnBootstrap")
             .orElse(providers.environmentVariable("LP2LN_BOOTSTRAP"))
@@ -106,6 +107,7 @@ tasks.matching { it.name == "mergeReleaseJniLibFolders" }.configureEach {
 }
 
 dependencies {
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)

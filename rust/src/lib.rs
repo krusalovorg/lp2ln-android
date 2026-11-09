@@ -1,8 +1,11 @@
 mod files;
-use std::net::{SocketAddr, ToSocketAddrs};
+mod image_preview;
+mod peers;
+mod sharing;
+use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use jni::objects::{JClass, JString};
@@ -17,9 +20,14 @@ use tokio::runtime::{Builder, Runtime};
 
 struct NativeNode {
     runtime: Runtime,
-    node: NodeRuntime,
+    node: Arc<NodeRuntime>,
     started_at: Instant,
     data_directory: String,
+    known_peers: Arc<Mutex<peers::PeerAddressBook>>,
+    discovery_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    bootstrap_warning: Option<String>,
+    file_index: Arc<files::FileIndex>,
+    sharing_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 static NODE: OnceLock<Mutex<Option<Arc<NativeNode>>>> = OnceLock::new();
@@ -37,17 +45,36 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
         return Ok(snapshot(existing));
     }
 
-    let bootstrap: SocketAddr = bootstrap_address
-        .to_socket_addrs()
-        .with_context(|| format!("invalid bootstrap address: {bootstrap_address}"))?
-        .find(|address| address.is_ipv4()).context("Bootstrap has no IPv4 address")?;
     let database = Arc::new(
         P2PDatabase::new(&data_directory).context("failed to open LP2LN database")?,
     );
+    let own_peer = database.get_or_create_node_keypair()?.peer_id().to_owned();
+    let book = peers::PeerAddressBook::open(std::path::Path::new(&data_directory), &own_peer);
+    let mut targets = book.targets();
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("lp2ln")
+        .build()
+        .context("failed to create LP2LN runtime")?;
+    let bootstrap_warning = if bootstrap_address.trim().is_empty() {
+        None
+    } else {
+        let resolved = runtime.block_on(async {
+            let addresses = tokio::time::timeout(Duration::from_secs(3),
+                tokio::net::lookup_host(bootstrap_address.as_str())).await
+                .context("Bootstrap DNS lookup timed out")??;
+            addresses.into_iter().find(SocketAddr::is_ipv4).context("Bootstrap has no IPv4 address")
+        });
+        match resolved {
+            Ok(address) => { peers::add_primary(&mut targets, address); None }
+            Err(error) => Some(format!("Bootstrap недоступен: {error}. Используются сохранённые адреса и поиск в локальной сети.")),
+        }
+    };
     let mut options = NodeOptions::empty()
         .with_listen("tcp", "0.0.0.0:0".parse()?)
         .with_listen("udp", "0.0.0.0:0".parse()?)
-        .add_bootstrap_node(bootstrap, ["tcp"], None)
+        .with_bootstrap_nodes(targets)
         .with_peer_connection_policy(PeerConnectionPolicy {
             min_active_peers: 1,
             target_active_peers: 4,
@@ -55,6 +82,8 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
         })
         .allow_unsigned_packets(false);
     options.experimental.content = true;
+    options.database_dir = Some(std::path::PathBuf::from(&data_directory));
+    options.signature_format = lp2ln_core_v2::crypto::signature::SignatureFormat::V4Hash;
     options.experimental.dht = true;
     options.logger_options = None;
     options.lan_discovery.enabled = true;
@@ -67,21 +96,25 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
         .add_transport(Arc::new(UdpTransport::new()))
         .build(options)
         .context("failed to build LP2LN node")?;
-    let runtime = Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .thread_name("lp2ln")
-        .build()
-        .context("failed to create LP2LN runtime")?;
     runtime
         .block_on(node.start())
         .context("failed to start LP2LN node")?;
 
+    let node = Arc::new(node);
+    let known_peers = Arc::new(Mutex::new(book));
+    let discovery_task = runtime.spawn(peers::maintain(node.clone(), known_peers.clone()));
+    let file_index = Arc::new(files::FileIndex::new(&data_directory));
+    let sharing_task = runtime.spawn(sharing::listen(node.clone(), file_index.clone()));
     let native = Arc::new(NativeNode {
         runtime,
         node,
         started_at: Instant::now(),
         data_directory,
+        known_peers,
+        discovery_task: Mutex::new(Some(discovery_task)),
+        bootstrap_warning,
+        file_index,
+        sharing_task: Mutex::new(Some(sharing_task)),
     });
     let result = snapshot(&native);
     *slot = Some(native);
@@ -130,6 +163,8 @@ fn snapshot(native: &NativeNode) -> Value {
         "lastError": health.last_error.unwrap_or_default(),
         "sessions": session_values,
         "storage": files::state(native),
+        "discovery": native.known_peers.lock().map(|book| book.snapshot()).unwrap_or_default(),
+        "bootstrapWarning": native.bootstrap_warning,
     })
 }
 
@@ -138,6 +173,12 @@ fn stop_node() -> Result<Value> {
         .lock()
         .map_err(|_| anyhow::anyhow!("LP2LN state lock is poisoned"))?;
     if let Some(native) = slot.take() {
+        for task in [&native.discovery_task, &native.sharing_task] {
+            if let Some(task) = task.lock().ok().and_then(|mut task| task.take()) {
+                task.abort();
+                let _ = native.runtime.block_on(task);
+            }
+        }
         native
             .runtime
             .block_on(native.node.stop())
@@ -223,4 +264,43 @@ pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridg
 ) -> jstring {
     let args: Result<_> = (|| Ok((read_string(&mut env, id)?, read_string(&mut env, destination)?)))();
     return_json(&mut env, || { let (id, destination) = args?; files::export(id, destination) })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeShare(
+    mut env: JNIEnv, _class: JClass, id: JString, recipient: JString,
+) -> jstring {
+    let args: Result<_> = (|| Ok((read_string(&mut env, id)?, read_string(&mut env, recipient)?)))();
+    return_json(&mut env, || {
+        let (id, recipient) = args?;
+        let native = files::get_native()?;
+        let capability = files::share_capability(&native, &id)?;
+        files::progress(json!({"busy":true,"name":capability["name"],"stage":"Отправка ключа","done":0,"total":0}));
+        let result = native.runtime.block_on(sharing::send(&native.node, &recipient, capability));
+        files::progress(json!({"busy":false}));
+        result
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeDownload(
+    mut env: JNIEnv, _class: JClass, id: JString,
+) -> jstring {
+    let id = read_string(&mut env, id);
+    return_json(&mut env, || {
+        let native = files::get_native()?;
+        files::download(&native, &id?)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeThumbnail(
+    mut env: JNIEnv, _class: JClass, id: JString, destination: JString,
+) -> jstring {
+    let args: Result<_> = (|| Ok((read_string(&mut env, id)?, read_string(&mut env, destination)?)))();
+    return_json(&mut env, || {
+        let (id, destination) = args?;
+        let native = files::get_native()?;
+        image_preview::fetch(&native, &id, &destination)
+    })
 }

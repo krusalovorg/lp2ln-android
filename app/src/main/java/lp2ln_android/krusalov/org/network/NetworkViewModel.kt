@@ -1,8 +1,11 @@
 package lp2ln_android.krusalov.org.network
 
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.provider.OpenableColumns
+import android.webkit.MimeTypeMap
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -32,6 +35,60 @@ class NetworkViewModel(
     val notice = _notice.asStateFlow()
     fun clearNotice() { _notice.value = null }
 
+    private val _image = MutableStateFlow(ImageViewState())
+    val image = _image.asStateFlow()
+
+    fun closeImage() { _image.value = ImageViewState() }
+
+    fun viewImage(context: Context, file: StoredFile) {
+        if (_image.value.fileId == file.id && _image.value.loading) return
+        if (_fileBusy.value || _state.value.transfer.busy) {
+            _image.value = ImageViewState(fileId = file.id, error = "Дождитесь завершения текущей передачи")
+            return
+        }
+        _fileBusy.value = true
+        _image.value = ImageViewState(fileId = file.id, loading = true)
+        viewModelScope.launch {
+            fun update(transform: (ImageViewState) -> ImageViewState) {
+                if (_image.value.fileId == file.id) _image.value = transform(_image.value)
+            }
+            try {
+                withContext(Dispatchers.IO) {
+                    nodeMutex.withLock {
+                        // Private, bounded thumbnail cache. Full plaintext originals
+                        // are only staged for decoding and removed immediately.
+                        if (file.hasThumbnail) {
+                            runCatching {
+                                val directory = File(context.cacheDir, "thumbnails").also { it.mkdirs() }
+                                val cached = File(directory, "${file.id}.jpg")
+                                if (!cached.exists()) repository.thumbnail(file.id, cached.absolutePath)
+                                check(cached.length() <= ImagePreview.MAX_THUMBNAIL_BYTES)
+                                val bitmap = ImagePreview.decode(cached, 256, thumbnail = true)
+                                cached.setLastModified(System.currentTimeMillis())
+                                update { it.copy(thumbnail = bitmap) }
+                                var total = 0L
+                                directory.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() }
+                                    ?.forEach { total += it.length(); if (total > 4L * 1024 * 1024) it.delete() }
+                            }
+                        }
+                        val current = _state.value.files.find { it.id == file.id } ?: file
+                        if (!current.availableLocally) repository.download(file.id)
+                        _state.value = repository.snapshot(_state.value.bootstrapAddress)
+                        val temporary = File.createTempFile("image-", ".bin", context.cacheDir)
+                        try {
+                            repository.export(file.id, temporary.absolutePath)
+                            val bitmap = ImagePreview.decode(temporary, 2048)
+                            update { it.copy(image = bitmap, loading = false) }
+                        } finally { temporary.delete() }
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                update { it.copy(loading = false, error = error.message ?: "Не удалось загрузить изображение") }
+            } finally { _fileBusy.value = false }
+        }
+    }
+
     fun importFile(context: Context, uri: Uri) {
         if (_fileBusy.value || _state.value.transfer.busy) return
         _fileBusy.value = true
@@ -57,12 +114,16 @@ class NetworkViewModel(
                                 }
                             }
                         } ?: error("Не удалось прочитать файл")
+                        ImagePreview.createThumbnail(staging)
                         nodeMutex.withLock {
                             repository.upload(staging.absolutePath, name)
                             handedOff = true
                             _state.value = repository.snapshot(_state.value.bootstrapAddress)
                         }
-                    } finally { if (!handedOff) staging.delete() }
+                    } finally { if (!handedOff) {
+                        staging.delete()
+                        File(staging.absolutePath + ".preview").delete()
+                    } }
                 }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -85,6 +146,66 @@ class NetworkViewModel(
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 _notice.value = error.message
+            } finally { _fileBusy.value = false }
+        }
+    }
+
+    fun shareFile(file: StoredFile, recipient: String) {
+        if (_fileBusy.value || _state.value.transfer.busy) return
+        _fileBusy.value = true
+        viewModelScope.launch {
+            try {
+                val direct = withContext(Dispatchers.IO) {
+                    nodeMutex.withLock { repository.share(file.id, recipient) }
+                }
+                _notice.value = if (direct) "Друг получил ключ напрямую. Теперь он может скачать файл."
+                    else "Друг получил ключ через ноду. Теперь он может скачать файл."
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message ?: "Не удалось отправить файл"
+            } finally { _fileBusy.value = false }
+        }
+    }
+
+    fun downloadFile(file: StoredFile) {
+        if (_fileBusy.value || _state.value.transfer.busy) return
+        _fileBusy.value = true
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    nodeMutex.withLock {
+                        repository.download(file.id)
+                        _state.value = repository.snapshot(_state.value.bootstrapAddress)
+                    }
+                }
+                _notice.value = "Файл получен. Его можно открыть."
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message ?: "Не удалось скачать файл"
+            } finally { _fileBusy.value = false }
+        }
+    }
+
+    fun openFile(context: Context, file: StoredFile) {
+        if (_fileBusy.value || !file.availableLocally) return
+        _fileBusy.value = true
+        viewModelScope.launch {
+            try {
+                val uri = withContext(Dispatchers.IO) {
+                    val directory = File(context.cacheDir, "shared-preview/${file.id}").also { it.mkdirs() }
+                    val extension = file.name.substringAfterLast('.', "bin")
+                        .takeIf { it.matches(Regex("[A-Za-z0-9]{1,10}")) } ?: "bin"
+                    val preview = File(directory, "file.$extension")
+                    repository.export(file.id, preview.absolutePath)
+                    FileProvider.getUriForFile(context, "${context.packageName}.files", preview)
+                }
+                val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(
+                    file.name.substringAfterLast('.', "").lowercase()) ?: "application/octet-stream"
+                context.startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+                    .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = "Не удалось открыть файл. Попробуйте сохранить его на устройство."
             } finally { _fileBusy.value = false }
         }
     }
@@ -125,10 +246,6 @@ class NetworkViewModel(
             ?.getOrNull()
             ?.takeIf { it.isNotEmpty() }
         val bootstrap = stored ?: _state.value.bootstrapAddress
-        if (bootstrap.isBlank()) {
-            _state.value = NetworkState(phase = ConnectionPhase.STOPPED)
-            return
-        }
         launchNode(bootstrap, restart = false)
     }
 
@@ -163,9 +280,14 @@ class NetworkViewModel(
             if (_state.value.phase == ConnectionPhase.ERROR) return@launch
 
             while (isActive) {
-                delay(SNAPSHOT_INTERVAL_MS)
-                _state.value = withContext(Dispatchers.IO) {
+                delay(if (_fileBusy.value) 200L else SNAPSHOT_INTERVAL_MS)
+                val previousFiles = _state.value.files.map { it.id }.toSet()
+                val snapshot = withContext(Dispatchers.IO) {
                     repository.snapshot(bootstrap)
+                }
+                _state.value = snapshot
+                snapshot.files.firstOrNull { it.incoming && it.id !in previousFiles }?.let {
+                    _notice.value = "Вам отправили ${it.name}"
                 }
             }
         }

@@ -18,6 +18,8 @@ enum class ConnectionPhase {
     ERROR,
 }
 
+data class KnownNodeAddress(val peerId: String, val address: String, val protocol: String)
+
 data class NetworkState(
     val phase: ConnectionPhase = ConnectionPhase.STARTING,
     val peerId: String = "",
@@ -31,6 +33,9 @@ data class NetworkState(
     val error: String? = null,
     val files: List<StoredFile> = emptyList(),
     val transfer: FileTransfer = FileTransfer(),
+    val knownNodes: List<KnownNodeAddress> = emptyList(),
+    val discoveryError: String? = null,
+    val bootstrapWarning: String? = null,
 ) {
     companion object {
         val DEFAULT_BOOTSTRAP: String = lp2ln_android.krusalov.org.BuildConfig.LP2LN_BOOTSTRAP
@@ -40,8 +45,15 @@ data class NetworkState(
 data class StoredFile(
     val id: String, val name: String, val size: Long, val uploaded: Boolean,
     val replicas: Int, val error: String? = null,
-)
+    val incoming: Boolean = false, val availableLocally: Boolean = true,
+    val senderPeerId: String? = null,
+    val hasThumbnail: Boolean = false,
+) {
+    val isImage: Boolean get() = hasThumbnail || name.substringAfterLast('.', "").lowercase() in
+        setOf("jpg", "jpeg", "png", "webp", "heic", "heif", "gif", "bmp", "avif")
+}
 data class FileTransfer(
     val busy: Boolean = false, val name: String = "", val stage: String = "",
     val done: Long = 0, val total: Long = 0, val error: String? = null,
+    val fileId: String = "",
 )

@@ -35,6 +35,9 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import lp2ln_android.krusalov.org.network.*
 import lp2ln_android.krusalov.org.ui.theme.Lp2lnandroidTheme
+import lp2ln_android.krusalov.org.ui.ReceiveFileDialog
+import lp2ln_android.krusalov.org.ui.SendFileDialog
+import lp2ln_android.krusalov.org.ui.ImageViewer
 
 private val Blue = Color(0xFF3478F6)
 private val Secondary = Color(0xFF83858C)
@@ -54,6 +57,8 @@ private fun NetworkRoute(viewModel: NetworkViewModel = viewModel()) {
     val state by viewModel.state.collectAsState()
     val fileBusy by viewModel.fileBusy.collectAsState()
     val notice by viewModel.notice.collectAsState()
+    val image by viewModel.image.collectAsState()
+    var imageFile by remember { mutableStateOf<StoredFile?>(null) }
     var exportId by rememberSaveable { mutableStateOf<String?>(null) }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { viewModel.importFile(context.applicationContext, it) }
@@ -66,7 +71,18 @@ private fun NetworkRoute(viewModel: NetworkViewModel = viewModel()) {
     LaunchedEffect(Unit) { viewModel.connect(context.filesDir) }
     NetworkScreen(state, fileBusy, notice, viewModel::clearNotice,
         { picker.launch(arrayOf("*/*")) }, viewModel::retryFile,
-        { exportId = it.id; saver.launch(it.name) }, viewModel::retry, viewModel::reconnect)
+        { exportId = it.id; saver.launch(it.name) }, viewModel::retry, viewModel::reconnect,
+        onShare = viewModel::shareFile, onDownload = viewModel::downloadFile,
+        onOpen = { if (it.isImage) { imageFile = it; viewModel.viewImage(context.applicationContext, it) }
+            else viewModel.openFile(context.applicationContext, it) },
+        onPreview = { imageFile = it; viewModel.viewImage(context.applicationContext, it) })
+    imageFile?.let { selected ->
+        val file = state.files.find { it.id == selected.id } ?: selected
+        ImageViewer(file, image, state.transfer,
+            dismiss = { imageFile = null; viewModel.closeImage() },
+            retry = { viewModel.viewImage(context.applicationContext, file) },
+            save = { exportId = file.id; saver.launch(file.name) })
+    }
 }
 
 @Composable
@@ -74,10 +90,15 @@ private fun NetworkScreen(
     state: NetworkState, fileBusy: Boolean, notice: String?, dismissNotice: () -> Unit,
     onAdd: () -> Unit, onRetryFile: (StoredFile) -> Unit, onSave: (StoredFile) -> Unit,
     onRetry: () -> Unit, onReconnect: (String) -> Unit, initialTab: Int = 0,
+    onShare: (StoredFile, String) -> Unit = { _, _ -> },
+    onDownload: (StoredFile) -> Unit = {}, onOpen: (StoredFile) -> Unit = {},
+    onPreview: (StoredFile) -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableStateOf(initialTab) }
     var search by rememberSaveable { mutableStateOf("") }
     var selectedFile by remember { mutableStateOf<StoredFile?>(null) }
+    var sharingFile by remember { mutableStateOf<StoredFile?>(null) }
+    var receiving by rememberSaveable { mutableStateOf(false) }
     val busy = fileBusy || state.transfer.busy
     val available = state.phase in listOf(ConnectionPhase.CONNECTED, ConnectionPhase.SEARCHING, ConnectionPhase.DEGRADED)
     val visibleFiles = remember(state.files, search) { state.files.filter { it.name.contains(search, ignoreCase = true) } }
@@ -123,10 +144,13 @@ private fun NetworkScreen(
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                         Text(if (tab == 0) "Файлы" else "Сеть", fontSize = 34.sp, lineHeight = 40.sp,
                             fontWeight = FontWeight.Bold, letterSpacing = (-0.8).sp)
-                        if (tab == 0) IconButton(onClick = onAdd, enabled = available && !busy,
+                        if (tab == 0) Row(verticalAlignment = Alignment.CenterVertically) {
+                            TextButton(onClick = { receiving = true }, enabled = state.peerId.isNotBlank()) { Text("Получить") }
+                            IconButton(onClick = onAdd, enabled = available && !busy,
                             modifier = Modifier.size(44.dp).background(if (available && !busy) Blue else DividerColor, CircleShape)
                                 .semantics { contentDescription = "Добавить файл" }) {
                             LineIcon("plus", Color.White, Modifier.size(23.dp))
+                            }
                         }
                     }
                     if (tab == 0) {
@@ -181,9 +205,10 @@ private fun NetworkScreen(
                     }
                 }
                 items(visibleFiles, key = { it.id }) { file ->
-                    FileRow(file, busy, available, { onRetryFile(file) }, { onSave(file) }, { selectedFile = file })
+                    FileRow(file, busy, available, { onRetryFile(file) }, { onSave(file) }, { selectedFile = file },
+                        { sharingFile = file }, { onDownload(file) }, { onOpen(file) }, { onPreview(file) })
                 }
-            } else item { NetworkDetails(state, busy, onRetry, onReconnect) }
+            } else item { NetworkDetails(state, busy, onRetry, onReconnect, { receiving = true }) }
         }
     }
     selectedFile?.let { file ->
@@ -191,21 +216,33 @@ private fun NetworkScreen(
         AlertDialog(onDismissRequest = { selectedFile = null }, title = { Text(file.name, maxLines = 3) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                    Text(formatBytes(file.size) + " · " + if (file.uploaded) "В сети" else "На устройстве")
+                    Text(formatBytes(file.size) + " · " + fileStatus(file))
                     Text("ID файла", color = Secondary, fontSize = 12.sp)
                     SelectionContainer { Text(file.id, fontSize = 12.sp) }
                     TextButton(onClick = { clipboard.setText(AnnotatedString(file.id)) }) { Text("Копировать ID") }
-                    Text(if (file.uploaded) "Сохранение подтверждено другим узлом." else "Файл ещё не сохранён на другом узле.",
+                    Text(when {
+                        !file.availableLocally -> "Друг отправил вам ключ. Скачайте файл, чтобы открыть содержимое."
+                        file.incoming -> "Файл получен от ${file.senderPeerId?.take(12)}…"
+                        file.uploaded -> "Сохранение подтверждено другим узлом."
+                        else -> "Файл ещё не сохранён на другом узле."
+                    },
                         color = Secondary, fontSize = 13.sp)
                     file.error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
                 }
             }, confirmButton = { TextButton(onClick = { selectedFile = null }) { Text("Готово") } },
             containerColor = Color.White, tonalElevation = 0.dp)
     }
+    if (receiving) ReceiveFileDialog(state.peerId) { receiving = false }
+    sharingFile?.let { file ->
+        SendFileDialog(file, state.peerId, busy,
+            send = { recipient -> sharingFile = null; onShare(file, recipient) },
+            dismiss = { sharingFile = null })
+    }
 }
 
 @Composable
-private fun FileRow(file: StoredFile, busy: Boolean, available: Boolean, retry: () -> Unit, save: () -> Unit, details: () -> Unit) {
+private fun FileRow(file: StoredFile, busy: Boolean, available: Boolean, retry: () -> Unit, save: () -> Unit, details: () -> Unit,
+                    share: () -> Unit, download: () -> Unit, open: () -> Unit, preview: () -> Unit) {
     var menu by remember { mutableStateOf(false) }
     val extension = file.name.substringAfterLast('.', "").lowercase()
     val tint = when (extension) {
@@ -215,7 +252,7 @@ private fun FileRow(file: StoredFile, busy: Boolean, available: Boolean, retry: 
         else -> Blue
     }
     Column {
-        Row(Modifier.fillMaxWidth().clickable(onClick = details).padding(vertical = 6.dp),
+        Row(Modifier.fillMaxWidth().clickable(onClick = if (file.isImage) preview else details).padding(vertical = 6.dp),
             verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
             Box(Modifier.size(48.dp).background(tint.copy(alpha = 0.09f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
                 LineIcon("file", tint, Modifier.size(25.dp))
@@ -225,17 +262,25 @@ private fun FileRow(file: StoredFile, busy: Boolean, available: Boolean, retry: 
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text(formatBytes(file.size), fontSize = 12.sp, color = Secondary)
                     Text("·", color = Secondary)
-                    Text(if (file.uploaded) "В сети" else "На устройстве", color = if (file.uploaded) Green else Secondary, fontSize = 12.sp)
+                    Text(fileStatus(file), color = if (!file.availableLocally) Blue else if (file.uploaded || file.incoming) Green else Secondary, fontSize = 12.sp)
                 }
             }
+            if (!file.availableLocally) TextButton(onClick = download, enabled = !busy && available) { Text("Скачать") }
             Box {
                 IconButton(onClick = { menu = true }, modifier = Modifier.semantics { contentDescription = "Действия с ${file.name}" }) {
                     Text("⋯", fontSize = 24.sp, color = Secondary)
                 }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    if (!file.uploaded) DropdownMenuItem(text = { Text("Отправить в сеть") }, enabled = !busy && available,
+                    if (file.isImage) DropdownMenuItem(text = { Text("Посмотреть изображение") },
+                        onClick = { menu = false; preview() })
+                    if (!file.uploaded && !file.incoming) DropdownMenuItem(text = { Text("Отправить в сеть") }, enabled = !busy && available,
                         onClick = { menu = false; retry() })
-                    DropdownMenuItem(text = { Text("Сохранить на устройство") }, enabled = !busy, onClick = { menu = false; save() })
+                    if (file.availableLocally) {
+                        DropdownMenuItem(text = { Text("Отправить другу") }, enabled = !busy && available,
+                            onClick = { menu = false; share() })
+                        DropdownMenuItem(text = { Text("Открыть") }, enabled = !busy, onClick = { menu = false; open() })
+                        DropdownMenuItem(text = { Text("Сохранить на устройство") }, enabled = !busy, onClick = { menu = false; save() })
+                    }
                     DropdownMenuItem(text = { Text("Сведения") }, onClick = { menu = false; details() })
                 }
             }
@@ -253,7 +298,8 @@ private fun Group(content: @Composable ColumnScope.() -> Unit) {
 }
 
 @Composable
-private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Unit, onReconnect: (String) -> Unit) {
+private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Unit, onReconnect: (String) -> Unit,
+                           onReceive: () -> Unit) {
     var editing by rememberSaveable { mutableStateOf(false) }
     var address by rememberSaveable(state.bootstrapAddress) { mutableStateOf(state.bootstrapAddress) }
     val clipboard = LocalClipboardManager.current
@@ -262,6 +308,7 @@ private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Un
             InfoRow("Статус", statusText(state.phase))
             Divider(color = DividerColor)
             InfoRow("Пиры", state.activePeers.toString())
+            TextButton(onClick = onReceive, enabled = state.peerId.isNotBlank()) { Text("Мой QR для получения файлов") }
             InfoRow("Получено", formatBytes(state.bytesReceived))
             InfoRow("Отправлено", formatBytes(state.bytesSent))
             InfoRow("Время работы", formatUptime(state.uptimeSeconds))
@@ -278,7 +325,7 @@ private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Un
                     horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                     Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
                         Text("Bootstrap", fontSize = 15.sp)
-                        Text(state.bootstrapAddress, fontSize = 13.sp, color = Secondary)
+                        Text(state.bootstrapAddress.ifBlank { "Не задан" }, fontSize = 13.sp, color = Secondary)
                     }
                     Text("›", fontSize = 26.sp, color = Secondary)
                 }
@@ -290,6 +337,21 @@ private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Un
                     }
                     TextButton(onClick = { clipboard.setText(AnnotatedString(state.peerId)) }, enabled = state.peerId.isNotBlank()) { Text("Копировать", fontSize = 12.sp) }
                 }
+                state.bootstrapWarning?.let { Text(it, color = Secondary, fontSize = 12.sp) }
+            }
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Известные адреса", color = Secondary, fontSize = 13.sp, modifier = Modifier.padding(start = 16.dp))
+            Group {
+                InfoRow("Сохранено", state.knownNodes.size.toString())
+                Text("Адреса других узлов запоминаются автоматически и используются при потере соединения.",
+                    color = Secondary, fontSize = 12.sp)
+                state.knownNodes.take(6).forEach { node ->
+                    Divider(color = DividerColor)
+                    InfoRow(node.address, node.protocol.uppercase())
+                }
+                if (state.knownNodes.size > 6) Text("Ещё ${state.knownNodes.size - 6}", color = Secondary, fontSize = 12.sp)
+                state.discoveryError?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
             }
         }
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -380,6 +442,12 @@ private fun statusText(phase: ConnectionPhase) = when (phase) {
     ConnectionPhase.DEGRADED -> "Нестабильно"
     ConnectionPhase.STOPPED -> "Остановлен"
     ConnectionPhase.ERROR -> "Нет подключения"
+}
+private fun fileStatus(file: StoredFile): String = when {
+    !file.availableLocally -> "Входящий файл"
+    file.incoming -> "Получен"
+    file.uploaded -> "В сети"
+    else -> "На устройстве"
 }
 private fun formatBytes(bytes: Long): String = when {
     bytes >= 1_048_576 -> String.format(java.util.Locale.forLanguageTag("ru"), "%.1f МБ", bytes / 1_048_576.0)

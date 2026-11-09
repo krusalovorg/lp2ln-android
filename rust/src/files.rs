@@ -19,7 +19,7 @@ static TRANSFER: OnceLock<Mutex<Value>> = OnceLock::new();
 fn transfer_slot() -> &'static Mutex<Value> {
     TRANSFER.get_or_init(|| Mutex::new(json!({"busy": false})))
 }
-fn progress(value: Value) {
+pub(crate) fn progress(value: Value) {
     if let Ok(mut state) = transfer_slot().lock() { *state = value; }
 }
 pub fn state(native: &NativeNode) -> Value {
@@ -28,27 +28,112 @@ pub fn state(native: &NativeNode) -> Value {
         "transfer": transfer_slot().lock().map(|v| v.clone()).unwrap_or_default()
     })
 }
-fn index_path(native: &NativeNode) -> std::path::PathBuf {
-    Path::new(&native.data_directory).join("android-files.json")
+pub(crate) struct FileIndex {
+    directory: std::path::PathBuf,
+    lock: Mutex<()>,
+}
+
+impl FileIndex {
+    pub(crate) fn new(directory: impl Into<std::path::PathBuf>) -> Self {
+        Self { directory: directory.into(), lock: Mutex::new(()) }
+    }
+
+    pub(crate) fn read(&self) -> Result<Vec<Value>> {
+        let path = self.directory.join("android-files.json");
+        if !path.exists() { return Ok(vec![]); }
+        Ok(serde_json::from_slice(&fs::read(path)?)?)
+    }
+
+    pub(crate) fn save(&self, entry: Value, incoming: bool) -> Result<()> {
+        use std::io::Write;
+        let _guard = self.lock.lock().map_err(|_| anyhow::anyhow!("File index lock unavailable"))?;
+        let mut entries = self.read()?;
+        if incoming && entries.iter().any(|v| v["id"] == entry["id"]) { return Ok(()); }
+        if incoming {
+            anyhow::ensure!(entries.iter().filter(|v| v["status"] == "offered").count() < 128,
+                "Слишком много ожидающих файлов");
+        }
+        entries.retain(|v| v["id"] != entry["id"]);
+        entries.insert(0, entry);
+        let path = self.directory.join("android-files.json");
+        let temp = path.with_extension("tmp");
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(&serde_json::to_vec(&entries)?)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(temp, path)?;
+        #[cfg(unix)]
+        fs::File::open(&self.directory)?.sync_all()?;
+        Ok(())
+    }
 }
 fn read_index(native: &NativeNode) -> Result<Vec<Value>> {
-    let path = index_path(native);
-    if !path.exists() { return Ok(vec![]); }
-    Ok(serde_json::from_slice(&fs::read(path)?)?)
+    native.file_index.read()
 }
 fn save_entry(native: &NativeNode, entry: Value) -> Result<()> {
-    let mut entries = read_index(native)?;
-    entries.retain(|v| v["id"] != entry["id"]);
-    entries.insert(0, entry);
-    let path = index_path(native);
-    let temp = path.with_extension("tmp");
-    fs::write(&temp, serde_json::to_vec(&entries)?)?;
-    fs::rename(temp, path)?;
-    Ok(())
+    native.file_index.save(entry, false)
 }
-fn get_native() -> Result<Arc<NativeNode>> {
+pub(crate) fn get_native() -> Result<Arc<NativeNode>> {
     node_slot().lock().map_err(|_| anyhow::anyhow!("Node lock unavailable"))?
         .as_ref().cloned().context("Сначала подключитесь к сети")
+}
+
+pub(crate) fn share_capability(native: &NativeNode, id: &str) -> Result<Value> {
+    let entry = read_index(native)?.into_iter().find(|v| v["id"] == id).context("Файл не найден")?;
+    anyhow::ensure!(entry["status"] != "offered", "Сначала скачайте файл");
+    let mut providers = Vec::new();
+    if let Some(peer) = entry["peer"].as_str() { providers.push(peer.to_owned()); }
+    if let Some(existing) = entry["providers"].as_array() {
+        for peer in existing.iter().filter_map(Value::as_str).take(6) {
+            if !providers.iter().any(|p| p == peer) { providers.push(peer.to_owned()); }
+        }
+    }
+    providers.push(native.node.peer_id().to_owned());
+    Ok(json!({"id":entry["id"], "key":entry["key"], "name":entry["name"],
+        "size":entry["size"], "providers":providers,"image":entry["image"]}))
+}
+
+pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
+    let mut entry = read_index(native)?.into_iter().find(|v| v["id"] == id).context("Файл не найден")?;
+    let result = native.runtime.block_on(async {
+        let service = native.node.block_transfer_service().context("Хранилище недоступно")?;
+        let manifest_id = content_id_from_hex(id).context("Неверный ID файла")?;
+        let key = content_id_from_hex(entry["key"].as_str().context("Нет ключа файла")?).context("Неверный ключ")?;
+        let providers = entry["providers"].as_array().context("Нет источников файла")?
+            .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>();
+        progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла","done":0,"total":0}));
+        let sealed = service.fetch_from_providers(manifest_id, &providers).await?;
+        let manifest = FileManifest::decode(&decrypt_chunk(&key, 0, &sealed)?)?;
+        anyhow::ensure!(manifest.file_size <= MAX_FILE_SIZE && manifest.chunk_ids.len() <= 400,
+            "Файл превышает допустимый размер");
+        anyhow::ensure!(entry["size"].as_u64() == Some(manifest.file_size), "Размер файла отличается от приглашения");
+        service.store.put(&sealed)?;
+        progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла",
+            "done":0,"total":manifest.chunk_ids.len()}));
+        let mut size = 0u64;
+        for (index, block) in manifest.chunk_ids.iter().enumerate() {
+            let encrypted = service.fetch_from_providers(*block, &providers).await?;
+            let plain = decrypt_chunk(&manifest.file_key, index as u32, &encrypted)?;
+            size += plain.len() as u64;
+            anyhow::ensure!(size <= MAX_FILE_SIZE, "Файл превышает допустимый размер");
+            service.store.put(&encrypted)?;
+            progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла",
+                "done":index+1,"total":manifest.chunk_ids.len()}));
+        }
+        anyhow::ensure!(size == manifest.file_size, "Размер файла не совпадает");
+        entry["name"] = json!(manifest.original_name.chars().take(255).collect::<String>());
+        entry["size"] = json!(size);
+        entry["blocks"] = json!(manifest.chunk_ids.iter().map(content_id_hex).collect::<Vec<_>>());
+        entry["status"] = json!("received");
+        entry["error"] = Value::Null;
+        save_entry(native, entry.clone())?;
+        Ok::<_, anyhow::Error>(json!({"ok":true}))
+    });
+    match &result {
+        Ok(_) => progress(json!({"busy":false,"stage":"Файл получен"})),
+        Err(error) => progress(json!({"busy":false,"name":entry["name"],"error":format!("{error:#}")})),
+    }
+    result
 }
 pub fn begin(path: String, name: String, retry_id: String) -> Result<Value> {
     let native = get_native()?;
@@ -67,7 +152,10 @@ pub fn begin(path: String, name: String, retry_id: String) -> Result<Value> {
         }));
         // Only delete our own SAF staging files, never an arbitrary caller path.
         let staging = Path::new(&native.data_directory).join("imports");
-        if Path::new(&path).parent() == Some(staging.as_path()) { let _ = fs::remove_file(&path); }
+        if Path::new(&path).parent() == Some(staging.as_path()) {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(format!("{path}.preview"));
+        }
         match result {
             Ok(Ok(entry)) => progress(json!({"busy":false, "name":entry["name"], "stage":"Файл сохранён на другом узле", "done":1, "total":1})),
             Ok(Err(error)) => progress(json!({"busy":false, "name":name, "error":format!("{error:#}")})),
@@ -108,11 +196,12 @@ fn import(native: &NativeNode, path: &str, name: &str) -> Result<Value> {
     let manifest_key = generate_key();
     let sealed = encrypt_chunk(&manifest_key, 0, &postcard::to_allocvec(&manifest)?)?;
     let id = service.store.put(&sealed)?;
-    let entry = json!({
+    let mut entry = json!({
         "id":content_id_hex(&id), "name":name, "size":done, "createdAt":now,
         "key":content_id_hex(&manifest_key), "blocks":ids.iter().map(content_id_hex).collect::<Vec<_>>(),
         "status":"local", "replicas":0
     });
+    crate::image_preview::import(native, path, &mut entry)?;
     save_entry(native, entry.clone())?;
     Ok(entry)
 }
@@ -124,6 +213,12 @@ fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
         let mut ids: Vec<ContentId> = entry["blocks"].as_array().context("Invalid file index")?
             .iter().map(|v| content_id_from_hex(v.as_str().unwrap_or_default()).context("Invalid block ID"))
             .collect::<std::result::Result<_, _>>()?;
+        if let Some(image_blocks) = entry["imageBlocks"].as_array() {
+            for block in image_blocks {
+                ids.push(content_id_from_hex(block.as_str().context("Invalid image block")?)
+                    .context("Invalid image block")?);
+            }
+        }
         ids.push(content_id_from_hex(entry["id"].as_str().context("Missing ID")?).context("Invalid manifest ID")?);
         let mut last_error = String::new();
         // A replica means one peer acknowledged EVERY block, including the encrypted manifest.
@@ -166,9 +261,13 @@ fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
 }
 pub fn export(id: String, destination: String) -> Result<Value> {
     let native = get_native()?;
+    export_from(&native, &id, &destination)
+}
+
+fn export_from(native: &NativeNode, id: &str, destination: &str) -> Result<Value> {
     let entry = read_index(&native)?.into_iter().find(|v| v["id"] == id).context("Файл не найден")?;
     let service = native.node.block_transfer_service().context("Хранилище недоступно")?;
-    let manifest_id = content_id_from_hex(&id).context("Invalid manifest ID")?;
+    let manifest_id = content_id_from_hex(id).context("Invalid manifest ID")?;
     let key = content_id_from_hex(entry["key"].as_str().context("Missing key")?).context("Invalid file key")?;
     let bytes = service.store.get(&manifest_id)?.context("Манифест не найден")?;
     let manifest = FileManifest::decode(&decrypt_chunk(&key, 0, &bytes)?)?;
@@ -189,6 +288,136 @@ pub fn export(id: String, destination: String) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Models an apparently connected LAN/NAT UDP path that drops every frame.
+    struct BlackholeSession { peer: String }
+    #[async_trait::async_trait]
+    impl lp2ln_core_v2::sessions::Session for BlackholeSession {
+        fn id(&self) -> &str { "test-blackhole" }
+        fn peer_id(&self) -> Option<&str> { Some(&self.peer) }
+        fn kind(&self) -> lp2ln_core_v2::sessions::LinkKind { lp2ln_core_v2::sessions::LinkKind::DirectUdp }
+        async fn send(&self, _: lp2ln_core_v2::packet::Packet) -> Result<u64> { Ok(1) }
+        async fn send_wire(&self, _: Vec<u8>) -> Result<u64> { Ok(1) }
+        async fn close(&self) -> Result<()> { Ok(()) }
+        fn spawn_reader(self: Arc<Self>, _: tokio::sync::mpsc::Sender<lp2ln_core_v2::sessions::session::IncomingPacket>) {}
+    }
+
+    fn test_node(directory: &Path, routed_signatures: bool) -> (NativeNode, std::net::SocketAddr) {
+        use lp2ln_core_v2::{db::P2PDatabase, node::{NodeBuilder, NodeOptions}, transport::tcp::TcpTransport};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let mut options = NodeOptions::empty().with_listen("tcp", address);
+        options.logger_options = None;
+        options.lan_discovery.enabled = false;
+        options.debug_server.enabled = false;
+        options.ipc_tcp.enabled = false;
+        options.experimental.content = true;
+        options.database_dir = Some(directory.to_path_buf());
+        if routed_signatures {
+            options.signature_format = lp2ln_core_v2::crypto::signature::SignatureFormat::V4Hash;
+        }
+        let mut node = NodeBuilder::new().db(Arc::new(P2PDatabase::new(directory.to_str().unwrap()).unwrap()))
+            .add_transport(Arc::new(TcpTransport::new())).build(options).unwrap();
+        runtime.block_on(node.start()).unwrap();
+        let node = Arc::new(node);
+        let known_peers = Arc::new(Mutex::new(crate::peers::PeerAddressBook::open(directory, node.peer_id())));
+        let file_index = Arc::new(FileIndex::new(directory));
+        let task = runtime.spawn(crate::sharing::listen(node.clone(), file_index.clone()));
+        (NativeNode { runtime, node, data_directory: directory.to_string_lossy().into_owned(),
+            started_at: std::time::Instant::now(), known_peers, discovery_task: Mutex::new(None),
+            sharing_task: Mutex::new(Some(task)), bootstrap_warning: None, file_index }, address)
+    }
+
+    fn stop_test_node(native: &NativeNode) {
+        for task in [&native.discovery_task, &native.sharing_task] {
+            if let Some(task) = task.lock().unwrap().take() {
+                task.abort();
+                let _ = native.runtime.block_on(task);
+            }
+        }
+        native.runtime.block_on(native.node.stop()).unwrap();
+    }
+
+    #[test]
+    fn key_delivery_and_file_download_work_through_two_relays_with_sender_offline() {
+        let root = std::env::temp_dir().join(format!("lp2ln-relay-test-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        let (relay_one, addr_one) = test_node(&root.join("relay-one"), false);
+        let (relay_two, addr_two) = test_node(&root.join("relay-two"), false);
+        let (sender, _) = test_node(&root.join("sender"), true);
+        let (receiver, _) = test_node(&root.join("receiver"), true);
+        relay_one.runtime.block_on(relay_one.node.connect("tcp", addr_two)).unwrap();
+        sender.runtime.block_on(sender.node.connect("tcp", addr_one)).unwrap();
+        receiver.runtime.block_on(receiver.node.connect("tcp", addr_two)).unwrap();
+        sender.runtime.block_on(async {
+            for _ in 0..100 {
+                if sender.node.active_peer_count() == 1 && receiver.node.active_peer_count() == 1
+                    && relay_one.node.active_peer_count() == 2 && relay_two.node.active_peer_count() == 2
+                { return; }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            panic!("Four-node relay topology did not connect");
+        });
+        let original = (0..CHUNK_SIZE + 73).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let source = root.join("source.bin");
+        fs::write(&source, &original).unwrap();
+        let thumbnail = [0xff, 0xd8, 1, 2, 3, 4, 0xff, 0xd9];
+        fs::write(format!("{}.preview", source.display()), thumbnail).unwrap();
+        let entry = import(&sender, source.to_str().unwrap(), "shared.bin").unwrap();
+        let uploaded = publish(&sender, entry).unwrap();
+        let id = uploaded["id"].as_str().unwrap();
+        let capability = share_capability(&sender, id).unwrap();
+        // The real direct path is unusable. Key delivery and its acknowledgment
+        // must use reliable neighbors across both relays instead.
+        for (from, to) in [(&sender, &receiver), (&receiver, &sender)] {
+            let _runtime_guard = from.runtime.enter();
+            from.node.router().unwrap().register_session(to.node.peer_id().into(), "test-blackhole".into(),
+                Arc::new(BlackholeSession { peer: to.node.peer_id().to_owned() }));
+        }
+        let delivered = sender.runtime.block_on(crate::sharing::send(&sender.node, receiver.node.peer_id(), capability)).unwrap();
+        assert_eq!(delivered["path"], "relay");
+        let inbox = receiver.file_index.read().unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0]["status"], "offered");
+        assert_eq!(inbox[0]["receivedFrom"], sender.node.peer_id());
+        assert!(receiver.node.block_transfer_service().unwrap().store.get(
+            &content_id_from_hex(id).unwrap()).unwrap().is_none());
+        receiver.runtime.block_on(receiver.node.router().unwrap().teardown_session(&"test-blackhole".into())).unwrap();
+        // The sender can close its app after the key is delivered: the remote
+        // replica supplies encrypted blocks across the two relay hops.
+        stop_test_node(&sender);
+        let preview = root.join("thumbnail.jpg");
+        let mut wrong_key = receiver.file_index.read().unwrap()[0].clone();
+        let correct_key = wrong_key["image"]["key"].clone();
+        wrong_key["image"]["key"] = json!(content_id_hex(&generate_key()));
+        receiver.file_index.save(wrong_key.clone(), false).unwrap();
+        assert!(crate::image_preview::fetch(&receiver, id, preview.to_str().unwrap()).is_err());
+        assert!(!preview.exists());
+        wrong_key["image"]["key"] = correct_key;
+        receiver.file_index.save(wrong_key, false).unwrap();
+        crate::image_preview::fetch(&receiver, id, preview.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(preview).unwrap(), thumbnail);
+        assert_eq!(receiver.file_index.read().unwrap()[0]["status"], "offered");
+        let receiver_store = &receiver.node.block_transfer_service().unwrap().store;
+        // Viewing a thumbnail must not fetch the original encrypted manifest or
+        // any full-sized content block.
+        for original_id in std::iter::once(&uploaded["id"]).chain(uploaded["blocks"].as_array().unwrap()) {
+            assert!(receiver_store.get(&content_id_from_hex(original_id.as_str().unwrap()).unwrap()).unwrap().is_none());
+        }
+        download(&receiver, id).unwrap();
+        let output = root.join("received.bin");
+        export_from(&receiver, id, output.to_str().unwrap()).unwrap();
+        assert_eq!(fs::read(output).unwrap(), original);
+        assert_eq!(receiver.file_index.read().unwrap()[0]["status"], "received");
+        stop_test_node(&receiver);
+        stop_test_node(&relay_one);
+        stop_test_node(&relay_two);
+        drop((sender, receiver, relay_one, relay_two));
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn encrypted_manifest_and_multiple_chunks_round_trip() {
         let store = lp2ln_core_v2::storage::MemoryBlockStore::new();
@@ -235,7 +464,11 @@ mod tests {
         let mut receiver = make_node(&root.join("receiver"), addr);
         let mut sender = make_node(&root.join("sender"), "127.0.0.1:0".parse().unwrap());
         runtime.block_on(async { receiver.start().await.unwrap(); sender.start().await.unwrap(); });
-        let native = NativeNode { runtime, node: sender, started_at: std::time::Instant::now(),
+        let known_peers = Arc::new(Mutex::new(crate::peers::PeerAddressBook::open(
+            &root.join("sender"), sender.peer_id())));
+        let native = NativeNode { runtime, node: Arc::new(sender), started_at: std::time::Instant::now(),
+            file_index: Arc::new(FileIndex::new(root.join("sender"))), sharing_task: Mutex::new(None),
+            known_peers, discovery_task: Mutex::new(None), bootstrap_warning: None,
             data_directory: root.join("sender").to_string_lossy().into_owned() };
         let original = (0..CHUNK_SIZE + 73).map(|i| (i % 251) as u8).collect::<Vec<_>>();
         let path = root.join("source.bin");

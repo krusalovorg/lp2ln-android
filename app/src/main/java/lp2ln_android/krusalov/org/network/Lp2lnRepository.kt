@@ -5,6 +5,24 @@ import org.json.JSONObject
 
 class Lp2lnRepository {
 
+    fun thumbnail(id: String, destination: String) {
+        val result = JSONObject(Lp2lnNativeBridge.nativeThumbnail(id, destination))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
+    fun share(id: String, recipient: String): Boolean {
+        check(Lp2lnNativeBridge.isAvailable) { Lp2lnNativeBridge.unavailableReason }
+        val result = JSONObject(Lp2lnNativeBridge.nativeShare(id, recipient))
+        check(result.optBoolean("ok")) { result.optString("error") }
+        return result.optString("path") == "direct"
+    }
+
+    fun download(id: String) {
+        check(Lp2lnNativeBridge.isAvailable) { Lp2lnNativeBridge.unavailableReason }
+        val result = JSONObject(Lp2lnNativeBridge.nativeDownload(id))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
     fun upload(path: String, name: String, retryId: String = "") {
         check(Lp2lnNativeBridge.isAvailable) { Lp2lnNativeBridge.unavailableReason }
         val result = JSONObject(Lp2lnNativeBridge.nativeUpload(path, name, retryId))
@@ -91,15 +109,30 @@ class Lp2lnRepository {
                 val file = filesJson.getJSONObject(index)
                 add(StoredFile(file.getString("id"), file.getString("name"), file.getLong("size"),
                     file.optString("status") == "uploaded", file.optInt("replicas"),
-                    file.optString("error").takeUnless { it.isBlank() || it == "null" }))
+                    file.optString("error").takeUnless { it.isBlank() || it == "null" },
+                    incoming = file.has("receivedFrom"), availableLocally = file.optString("status") != "offered",
+                    senderPeerId = file.optString("receivedFrom").takeUnless { it.isBlank() || it == "null" },
+                    hasThumbnail = file.optJSONObject("image") != null))
             }
         }
         val transfer = storage?.optJSONObject("transfer") ?: JSONObject()
+        val discovery = json.optJSONObject("discovery")
+        val addresses = discovery?.optJSONArray("addresses")
+        val knownNodes = buildList {
+            if (addresses != null) for (index in 0 until addresses.length()) {
+                val node = addresses.getJSONObject(index)
+                add(KnownNodeAddress(node.optString("peerId"), node.getString("address"), node.getString("protocol")))
+            }
+        }
         NetworkState(
+            knownNodes = knownNodes,
+            discoveryError = discovery?.optString("error")?.takeUnless { it.isBlank() || it == "null" },
+            bootstrapWarning = json.optString("bootstrapWarning").takeUnless { it.isBlank() || it == "null" },
             files = files,
             transfer = FileTransfer(transfer.optBoolean("busy"), transfer.optString("name"),
                 transfer.optString("stage"), transfer.optLong("done"), transfer.optLong("total"),
-                transfer.optString("error").takeUnless { it.isBlank() || it == "null" }),
+                transfer.optString("error").takeUnless { it.isBlank() || it == "null" },
+                transfer.optString("fileId")),
             phase = phase,
             peerId = json.optString("peerId"),
             activePeers = activePeers,

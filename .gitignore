@@ -22,3 +22,6 @@ local.properties
 /node/*/*.d
 /node/*/options.last-known-good.json
 /node/*/options.recovery.journal.jsonl
+
+# Environment-specific infrastructure and operational notes
+/deployment/private/
