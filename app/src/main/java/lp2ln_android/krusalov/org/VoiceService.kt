@@ -13,11 +13,17 @@ internal fun checked(text: String): JSONObject = JSONObject(text).also {
     check(it.optBoolean("ok")) { it.optString("error", "Native call failed") }
 }
 
+internal fun voiceEndpoints(peer: String, nodes: List<KnownNodeAddress>): List<String> =
+    nodes.asSequence().filter { it.peerId == peer && it.protocol == "quic" }
+        .map { it.address }.filter { it.isNotBlank() }.distinct().take(3).toList()
+
 class VoiceService : Service() {
     companion object {
         internal const val PROTOCOL = 0xff82
         internal var instance by mutableStateOf<VoiceService?>(null)
         internal var summary by mutableStateOf("Остановлен")
+        internal var callPeer by mutableStateOf("")
+        internal var error by mutableStateOf<String?>(null)
         internal var detail by mutableStateOf("")
         internal var incoming by mutableStateOf(false)
         internal var busy by mutableStateOf(false)
@@ -31,7 +37,31 @@ class VoiceService : Service() {
     private var self = ""
     private var pendingDial = 0L
     private var ticket = 0L
-    private var configured = false
+    private lateinit var node: NetworkViewModel
+    private val authorized = mutableSetOf<String>()
+    private var manualPeer = ""
+    private val lastInvite = mutableMapOf<String,Long>()
+    private fun foreground(microphone: Boolean) {
+        val types = if(Build.VERSION.SDK_INT >= 34) {
+            android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING or
+                (if(microphone) android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0)
+        } else if(Build.VERSION.SDK_INT>=30 && microphone) android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE else 0
+        startForeground(72, notice(if(microphone)"Звонок" else "Входящие звонки включены"), types)
+    }
+    private fun updateAllowed() {
+        val state=node.state.value
+        self=state.peerId
+        val wanted=linkedSetOf(manualPeer).apply {
+            addAll(state.messages.asReversed().take(128).map { it.peerId })
+            addAll(state.knownNodes.map { it.peerId })
+        }.filter { it.length==66 && it!=self }.take(128).toSet()
+        for(p in authorized-wanted) {
+            Lp2lnRealtimeBridge.nativeRevoke(p,PROTOCOL); authorized.remove(p);lastInvite.remove(p)
+        }
+        for(p in wanted-authorized) {
+            if(JSONObject(Lp2lnRealtimeBridge.nativeAuthorize(p,PROTOCOL)).optBoolean("ok")) authorized.add(p)
+        }
+    }
     private var outgoing = false
     private var audio: VoiceAudio? = null
     private var activeHandle = 0L
@@ -53,63 +83,77 @@ class VoiceService : Service() {
         super.onCreate()
         notices = getSystemService(NotificationManager::class.java)
         notices.createNotificationChannel(NotificationChannel("voice","Голос LP2LN",NotificationManager.IMPORTANCE_DEFAULT))
-        startForeground(72, notice("Подготовка"))
+        notices.createNotificationChannel(NotificationChannel("voice-incoming","Входящие звонки",NotificationManager.IMPORTANCE_HIGH))
+        foreground(false)
         wake = getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"lp2ln:voice")
         multicast = (applicationContext.getSystemService(Context.WIFI_SERVICE) as android.net.wifi.WifiManager)
             .createMulticastLock("lp2ln-voice-discovery")
         multicast.acquire()
-        NodeSession.acquire().connect(filesDir)
+        node=NodeSession.acquire()
+        node.connect(filesDir)
+        scope.launch { listen() }
         instance = this
     }
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == "stop") { stopSelf(); return START_NOT_STICKY }
         val peer = intent?.getStringExtra("peer").orEmpty().trim()
         val address = intent?.getStringExtra("endpoint").orEmpty().trim()
-        if (configured && selected != peer) { summary = "Сначала остановите приём"; return START_NOT_STICKY }
-        if (!configured && peer.isNotEmpty()) {
-            configured = true; selected = peer
-            scope.launch {
-                try {
-                    val status = withContext(Dispatchers.IO) { checked(Lp2lnRealtimeBridge.nativeStatus()) }
-                    self = status.getString("peerId")
-                    require(peer != self)
-                    withContext(Dispatchers.IO) { checked(Lp2lnRealtimeBridge.nativeAuthorize(peer,PROTOCOL)) }
-                    summary = "Ожидание вызова"
-                    launch { listen() }
-                    if (address.isNotEmpty()) dial(address)
-                } catch (e: Exception) { summary = "Ошибка: ${e.message}"; stopSelf() }
+        if(peer.isNotEmpty() && !busy) {
+            manualPeer=peer
+            updateAllowed()
+            if(address.isNotEmpty() || intent?.action=="call") {
+                val addresses=if(address.isNotEmpty())listOf(address) else
+                    voiceEndpoints(peer, node.state.value.knownNodes)
+                if(addresses.isEmpty()) error="У собеседника пока нет доступного прямого пути для звонка."
+                else {
+                    selected=peer;callPeer=peer
+                    if (enableMicrophoneService()) dial(addresses)
+                }
             }
-        } else if (configured && self.isNotEmpty() && address.isNotEmpty() && !busy) dial(address)
+        }
         return START_NOT_STICKY
     }
     private suspend fun listen() {
         while (currentCoroutineContext().isActive) {
+            updateAllowed()
             val raw = withContext(NonCancellable + Dispatchers.IO) { JSONObject(Lp2lnRealtimeBridge.nativeAccept(1000)) }
             if (!raw.optBoolean("ok")) { delay(100); continue }
             val h = raw.getLong("handle")
             if (!currentCoroutineContext().isActive) { closeHandle(h); return }
-            if (raw.getString("peerId") != selected || raw.getInt("protocol") != PROTOCOL ||
-                (busy && (self < selected || audio != null || (activeHandle != 0L && !outgoing)))) {
+            val remote=raw.getString("peerId")
+            if (remote !in authorized || raw.getInt("protocol") != PROTOCOL ||
+                (busy && (remote!=selected || self < selected || audio != null || (activeHandle != 0L && !outgoing)))) {
                 closeHandle(h); continue
             }
             // Both peers dialled. The lower Peer ID remains the initiator.
+            val now=SystemClock.elapsedRealtime()
+            if (!busy && now-(lastInvite[remote] ?: -6000L)<5000L) {closeHandle(h);continue}
+            lastInvite[remote]=now
+            selected=remote;callPeer=remote
             ++ticket; pendingDial = 0
             worker?.cancelAndJoin()
             begin(raw, false)
         }
     }
-    private fun dial(address: String) {
+    private fun dial(addresses: List<String>) {
         if (busy) return
+        val peer=selected
         val generation = ++ticket
         pendingDial = generation
         busy = true; summary = "Соединение"
         scope.launch {
             try {
-                val raw = withContext(NonCancellable + Dispatchers.IO) { checked(Lp2lnRealtimeBridge.nativeOpen(selected,address,PROTOCOL)) }
+                var raw:JSONObject?=null
+                for(address in addresses) {
+                    if(!isActive || generation!=pendingDial) break
+                    val attempt=withContext(NonCancellable+Dispatchers.IO) {JSONObject(Lp2lnRealtimeBridge.nativeOpen(peer,address,PROTOCOL))}
+                    if(attempt.optBoolean("ok")) {raw=attempt;break}
+                }
+                if(raw==null) throw IllegalStateException("Собеседник недоступен для прямого звонка")
                 if (!isActive || pendingDial != generation) closeHandle(raw.getLong("handle"))
                 else { pendingDial = 0; begin(raw, true) }
             } catch (e: Exception) {
-                if (pendingDial == generation) { pendingDial = 0; busy = false; summary = "Соединение: ${e.message}" }
+                if (pendingDial == generation) { pendingDial = 0; busy = false; summary = "Соединение: ${e.message}";error=summary;foreground(false) }
             }
         }
     }
@@ -149,8 +193,16 @@ class VoiceService : Service() {
                         break
                     }
                     if(event.getBoolean("incoming") && !incoming) {
-                        incoming=true; summary="Входящий от $selected"
-                        notices.notify(72,notice(summary))
+                        incoming=true
+                        val label=getSharedPreferences("contacts",MODE_PRIVATE).getString(selected,null)
+                            ?: node.state.value.messages.lastOrNull { it.peerId==selected && !it.outgoing }?.senderName ?: peerLabel(selected)
+                        summary="Входящий от $label"
+                        val open=PendingIntent.getActivity(this@VoiceService,7,Intent(this@VoiceService,MainActivity::class.java)
+                            .setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),PendingIntent.FLAG_IMMUTABLE)
+                        notices.notify(73,Notification.Builder(this@VoiceService,"voice-incoming")
+                            .setSmallIcon(R.drawable.ic_lp2ln_status).setCategory(Notification.CATEGORY_CALL)
+                            .setContentTitle(label).setContentText("Входящий голосовой звонок")
+                            .setTimeoutAfter(30000).setContentIntent(open).setAutoCancel(true).build())
                     }
                     if(state=="Active" && activeAt==0L) {
                         val engine = VoiceAudio(this@VoiceService,h) { reason ->
@@ -190,7 +242,7 @@ class VoiceService : Service() {
                     delay(if(activeAt==0L) 150 else 450)
                 }
             } catch (e: CancellationException) { throw e }
-            catch (e: Exception) { summary="Звонок завершён: ${e.message}" }
+            catch (e: Exception) { summary="Звонок завершён: ${e.message}";error=summary }
             finally {
                 val engine=audio
                 audio=null
@@ -207,22 +259,37 @@ class VoiceService : Service() {
                 if(activeHandle==h && instance===this@VoiceService) {
                     if(wake.isHeld)wake.release()
                     outgoing=false;activeHandle=0;incoming=false;busy=false;muted=false;loud=false
-                    notices.notify(72,notice("Ожидание вызова"))
+                    notices.cancel(73);foreground(false)
                 }
             }
         }
     }
     private suspend fun closeHandle(h:Long) { withContext(NonCancellable+Dispatchers.IO){Lp2lnRealtimeBridge.nativeClose(h)} }
-    internal fun accept() { if(activeHandle!=0L)VoiceBridge.decide(activeHandle,true); incoming=false }
+    private fun enableMicrophoneService(): Boolean = try {
+        foreground(true)
+        true
+    } catch (denied: SecurityException) {
+        error = "Откройте приложение и разрешите доступ к микрофону."
+        false
+    }
+
+    internal fun accept(expected: Long) {
+        if (!incoming || expected != activeHandle) return
+        if (!enableMicrophoneService()) { finishCall(); return }
+        VoiceBridge.decide(activeHandle, true)
+        incoming = false
+        notices.cancel(73)
+    }
+    internal fun ringingHandle()=activeHandle
     internal fun finishCall() {
-        if (pendingDial!=0L) {pendingDial=0;busy=false;summary="Вызов отменён"}
+        if (pendingDial!=0L) {pendingDial=0;busy=false;summary="Вызов отменён";foreground(false)}
         audio?.stopCapture()
         if(activeHandle!=0L)VoiceBridge.decide(activeHandle,false);incoming=false
     }
     internal fun toggleMute() { audio?.let { muted=!muted;it.mute=muted } }
     internal fun toggleSpeaker() { audio?.let { if(it.speaker(!loud)) loud=!loud } }
     override fun onDestroy() {
-        if(selected.isNotEmpty()) runCatching { Lp2lnRealtimeBridge.nativeRevoke(selected,PROTOCOL) }
+        authorized.forEach { runCatching { Lp2lnRealtimeBridge.nativeRevoke(it,PROTOCOL) } }; notices.cancel(73)
         audio?.stopCapture()
         scope.cancel()
         if(wake.isHeld)wake.release()

@@ -65,7 +65,7 @@ internal fun VoicePanel(state:NetworkState) {
             Manifest.permission.POST_NOTIFICATIONS) else arrayOf(Manifest.permission.RECORD_AUDIO))
     }
     Column(verticalArrangement=Arrangement.spacedBy(4.dp)) {
-        TextButton(onClick={expanded=!expanded}){Text(if(VoiceService.incoming)"Входящий звонок" else "Голос LP2LN")}
+        TextButton(onClick={expanded=!expanded}){Text(if(VoiceService.incoming)"Входящий звонок" else "Диагностика Flow")}
         if(expanded || VoiceService.incoming) {
             SelectionContainer { Text("Мой Peer ID\n${state.peerId}\nQUIC $local") }
             if(!VoiceService.busy) {
@@ -97,7 +97,7 @@ internal fun VoicePanel(state:NetworkState) {
                 TextButton(onClick={export.launch("lp2ln-call.json")}){Text("Сохранить отчёт звонка")}
             Text(VoiceService.summary)
             if(message.isNotBlank())Text(message)
-            if(VoiceService.incoming)Button(onClick={VoiceService.instance?.accept()}){Text("Принять")}
+
             if(VoiceService.busy) {
                 Row {
                     TextButton(onClick={VoiceService.instance?.finishCall()}){Text(if(VoiceService.incoming)"Отклонить" else "Завершить")}

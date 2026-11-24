@@ -67,8 +67,6 @@ fun ChatScreen(
     var newChat by rememberSaveable { mutableStateOf(false) }
     var myAddress by rememberSaveable { mutableStateOf(false) }
     var search by rememberSaveable { mutableStateOf("") }
-    val profile = java.io.File(androidx.compose.ui.platform.LocalContext.current.filesDir, "lp2ln/profile-name")
-    var profileOpen by rememberSaveable { mutableStateOf(false) }
     val names = remember(state.messages) {
         state.messages.filter { !it.outgoing }.sortedBy { it.createdAt }.associate { it.peerId to it.senderName }
     }
@@ -94,7 +92,6 @@ fun ChatScreen(
                 verticalArrangement = Arrangement.spacedBy(16.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text("Мой профиль", modifier = Modifier.clickable { profileOpen = true }, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, color = ChatGray)
                     Text(if (connected) "В сети" else "Нет соединения", fontSize = 12.sp, color = ChatGray)
                 }
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -125,7 +122,11 @@ fun ChatScreen(
                     (aliases[it.peerId] ?: names[it.peerId]).orEmpty().contains(search, true) || it.peerId.contains(search, true) || it.lastMessage.text.contains(search, true)
                 }
             }
-            if (conversations.isEmpty()) {
+            val nearby = if(lp2ln_android.krusalov.org.BuildConfig.VOICE_PREVIEW) state.knownNodes
+                .filter { it.protocol=="quic" }.map {it.peerId}.distinct().filter { id ->
+                    conversations.none { it.peerId==id } && (id.contains(search,true) || aliases[id].orEmpty().contains(search,true))
+                } else emptyList()
+            if (conversations.isEmpty() && nearby.isEmpty()) {
                 Column(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 36.dp),
                     horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
                     Box(Modifier.size(84.dp).background(ChatBlue.copy(alpha = .07f), RoundedCornerShape(26.dp)),
@@ -141,6 +142,11 @@ fun ChatScreen(
                     }
                 }
             } else LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(bottom = 90.dp)) {
+                items(nearby,key={"near-$it"}) { id ->
+                    TextButton(onClick={peer=id},modifier=Modifier.fillMaxWidth()) {
+                        Text(aliases[id] ?: names[id] ?: peerLabel(id)); Text(" · В сети",color=ChatGray)
+                    }
+                }
                 items(conversations, key = { it.peerId }) { conversation ->
                     ConversationRow(conversation, aliases[conversation.peerId] ?: names[conversation.peerId] ?: peerLabel(conversation.peerId), connected && state.chatPresence[conversation.peerId]?.status == "online") { peer = conversation.peerId }
                 }
@@ -163,17 +169,6 @@ fun ChatScreen(
     if (newChat) NewChatDialog(state.peerId, dismiss = { newChat = false }) { recipient ->
         peer = recipient
         newChat = false
-    }
-    if (profileOpen) {
-        var name by rememberSaveable { mutableStateOf(runCatching { profile.readText() }.getOrDefault("")) }
-        var failed by remember { mutableStateOf(false) }
-        AlertDialog(onDismissRequest = { profileOpen = false }, title = { Text("Мой профиль") },
-            text = { OutlinedTextField(name, { name = it.take(60) }, singleLine = true, isError = failed,
-                label = { Text("Имя для собеседников") }) },
-            confirmButton = { TextButton(onClick = {
-                runCatching { profile.parentFile?.mkdirs(); profile.writeText(name.trim()) }
-                    .onSuccess { profileOpen = false }.onFailure { failed = true }
-            }) { Text("Сохранить") } })
     }
     if (myAddress) ReceiveFileDialog(state.peerId, title = "Мой адрес",
         description = "Покажите QR собеседнику. Чтобы получать сообщения при закрытом чате, включите фоновую связь.") { myAddress = false }
@@ -261,6 +256,7 @@ private fun ColumnScope.ChatThread(peer: String, senderName: String?, alias: Str
                 }
             }
         }
+        if(lp2ln_android.krusalov.org.BuildConfig.VOICE_PREVIEW) lp2ln_android.krusalov.org.ChatCallButton(peer)
         IconButton(onClick = { info = true }, modifier = Modifier.semantics { contentDescription = "Адрес собеседника" }) {
             ChatIcon("info", ChatBlue, Modifier.size(22.dp))
         }

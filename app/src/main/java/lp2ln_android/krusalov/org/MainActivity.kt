@@ -47,6 +47,12 @@ private val DividerColor = Color(0xFFE9E9EE)
 private val Green = Color(0xFF26865D)
 
 class MainActivity : ComponentActivity() {
+    override fun onResume() {
+        super.onResume()
+        if(BuildConfig.VOICE_PREVIEW && VoiceService.instance==null)
+            androidx.core.content.ContextCompat.startForegroundService(this,android.content.Intent(this,VoiceService::class.java))
+    }
+
     override fun onDestroy() {
         NodeSession.release()
         super.onDestroy()
@@ -86,6 +92,7 @@ private fun NetworkRoute(viewModel: NetworkViewModel) {
         onPreview = { imageFile = it; viewModel.viewImage(context.applicationContext, it) },
         onAttach = { peer, uri, kind -> viewModel.importFile(context.applicationContext, uri, peer, kind) },
         onSendMessage = viewModel::sendMessage, onChatRead = viewModel::markChatRead, onChatProbe = viewModel::probeChat)
+    if(BuildConfig.VOICE_PREVIEW) CallOverlay(state)
     imageFile?.let { selected ->
         val file = state.files.find { it.id == selected.id } ?: selected
         ImageViewer(file, image, state.transfer,
@@ -128,13 +135,15 @@ private fun NetworkScreen(
         if (tab == 1) chatState.SaveableStateProvider("chat") {
             ChatScreen(state, onSendMessage, onChatRead, onAttach = onAttach, onFile = { if (it.isImage || it.availableLocally) onOpen(it) else onDownload(it) }, busy = busy, onProbe = onChatProbe, onConversationChanged = { chatOpen = it }, onNetwork = { tab = 2 },
                 modifier = Modifier.padding(padding).statusBarsPadding())
+        } else if (tab == 3) {
+            ProfileScreen(state.peerId, Modifier.padding(padding)) { receiving = true }
         } else {
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding).statusBarsPadding(),
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 90.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
-            if (BuildConfig.VOICE_PREVIEW) item { VoicePanel(state) }
+            if (tab == 2 && BuildConfig.VOICE_PREVIEW) item { VoicePanel(state) }
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,
@@ -224,13 +233,13 @@ private fun NetworkScreen(
                 color = Color.White, shape = RoundedCornerShape(32.dp), shadowElevation = 5.dp) {
                 Column {
                     Row(Modifier.fillMaxWidth().padding(4.dp)) {
-                        listOf("Файлы", "Чаты", "Сеть").forEachIndexed { index, title ->
+                        listOf("Файлы", "Чаты", "Сеть", "Профиль").forEachIndexed { index, title ->
                             val color = if (tab == index) Blue else Secondary
                             Column(Modifier.weight(1f).background(if (tab == index) Blue.copy(alpha = .10f) else Color.Transparent, CircleShape).clickable { tab = index }.padding(vertical = 5.dp),
                                 horizontalAlignment = Alignment.CenterHorizontally,
                                 verticalArrangement = Arrangement.spacedBy(5.dp)) {
                                 Box {
-                                    LineIcon(when (index) { 0 -> "folder"; 1 -> "chat"; else -> "network" }, color, Modifier.size(24.dp))
+                                    LineIcon(when (index) { 0 -> "folder"; 1 -> "chat"; 2 -> "network"; else -> "profile" }, color, Modifier.size(24.dp))
                                     if (index == 1 && state.messages.any { !it.outgoing && !it.read }) {
                                         Box(Modifier.align(Alignment.TopEnd).offset(x = 5.dp, y = (-2).dp)
                                             .size(7.dp).background(Blue, CircleShape))
@@ -419,12 +428,38 @@ private fun NetworkDetails(state: NetworkState, busy: Boolean, onRetry: () -> Un
 }
 
 @Composable
+private fun ProfileScreen(peerId: String, modifier: Modifier, showAddress: () -> Unit) {
+    val context = LocalContext.current
+    val file = remember { java.io.File(context.filesDir, "lp2ln/profile-name") }
+    var name by rememberSaveable { mutableStateOf(runCatching { file.readText() }.getOrDefault("")) }
+    var feedback by remember { mutableStateOf("") }
+    LazyColumn(modifier.fillMaxSize().statusBarsPadding(),
+        contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 24.dp, bottom = 96.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item { Text("Профиль", fontSize = 34.sp, fontWeight = FontWeight.Bold) }
+        item { OutlinedTextField(name, { name = it.take(60); feedback = "" }, Modifier.fillMaxWidth(),
+            singleLine = true, label = { Text("Имя для собеседников") }) }
+        item { Button(onClick = {
+            feedback = runCatching { file.parentFile?.mkdirs(); file.writeText(name.trim()) }
+                .fold({ "Имя сохранено" }, { "Не удалось сохранить имя" })
+        }) { Text("Сохранить") } }
+        if (feedback.isNotEmpty()) item { Text(feedback) }
+        if (peerId.isNotBlank()) item { TextButton(onClick = showAddress) { Text("Показать мой QR-код") } }
+    }
+}
+
+@Composable
 private fun LineIcon(kind: String, color: Color, modifier: Modifier = Modifier) {
     Canvas(modifier) {
         val w = size.width
         val h = size.height
         val stroke = Stroke(width = w * 0.065f)
         when (kind) {
+            "profile" -> {
+                drawCircle(color, w * .17f, Offset(w * .5f, h * .29f), style = stroke)
+                drawArc(color, 180f, 180f, false, Offset(w * .12f, h * .56f),
+                    androidx.compose.ui.geometry.Size(w * .76f, h * .6f), style = stroke)
+            }
             "plus" -> {
                 drawLine(color, Offset(w * .5f, h * .12f), Offset(w * .5f, h * .88f), strokeWidth = stroke.width)
                 drawLine(color, Offset(w * .12f, h * .5f), Offset(w * .88f, h * .5f), strokeWidth = stroke.width)
