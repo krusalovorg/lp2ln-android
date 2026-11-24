@@ -82,7 +82,7 @@ impl PeerAddressBook {
         let mut seen = HashSet::new();
         let mut targets = Vec::new();
         // TCP first: many mobile networks cannot accept incoming UDP traffic.
-        for protocol in ["tcp", "udp"] {
+        for protocol in ["tcp", "udp", "quic"] {
             for descriptor in &self.descriptors {
                 for line in &descriptor.observed_addrs {
                     if let Some((transport, addr)) = usable_address(line) {
@@ -113,7 +113,8 @@ impl PeerAddressBook {
 fn usable_address(line: &str) -> Option<(String, SocketAddr)> {
     let (protocol, addr) = parse_observed_addr_line(line)?;
     let ip = addr.ip();
-    if !matches!(protocol.as_str(), "tcp" | "udp") || !ip.is_ipv4()
+    let supported = matches!(protocol.as_str(), "tcp" | "udp") || (cfg!(feature = "realtime-preview") && protocol == "quic");
+    if !supported || !ip.is_ipv4()
         || addr.port() == 0 || ip.is_unspecified() || ip.is_loopback()
         || ip.is_multicast() || addr.ip().to_string() == "255.255.255.255"
     { return None; }

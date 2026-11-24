@@ -1,0 +1,33 @@
+[package]
+name = "lp2ln-android-bridge"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "../rust/src/lib.rs"
+name = "lp2ln_android"
+crate-type = ["cdylib"]
+
+[features]
+default = ["realtime-preview","voice-preview"]
+realtime-preview = []
+voice-preview = ["realtime-preview","dep:lp2ln-rtc"]
+
+[dependencies]
+lp2ln-rtc = { path = "../../lp2ln-realtime/crates/lp2ln-rtc", optional = true }
+anyhow = "1"
+jni = "0.21"
+lp2ln-core-v2 = { path = "../../lp2ln-realtime/crates/lp2ln-core-v2" }
+serde_json = "1"
+postcard = { version = "1", features = ["alloc"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
+
+[dev-dependencies]
+async-trait = "0.1"
+
+[profile.release]
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = true

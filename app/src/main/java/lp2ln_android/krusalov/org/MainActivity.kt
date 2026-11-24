@@ -134,6 +134,7 @@ private fun NetworkScreen(
             contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 90.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
+            if (BuildConfig.VOICE_PREVIEW) item { VoicePanel(state) }
             item {
                 Column(verticalArrangement = Arrangement.spacedBy(18.dp)) {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween,

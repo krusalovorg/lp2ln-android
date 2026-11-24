@@ -3,6 +3,8 @@ mod image_preview;
 mod peers;
 mod sharing;
 mod chat;
+#[cfg(feature = "realtime-preview")]
+mod realtime;
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -93,11 +95,19 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
     options.debug_server.enabled = false;
     options.ipc_tcp.enabled = false;
 
-    let mut node = NodeBuilder::new()
+    let builder = NodeBuilder::new()
         .db(database)
         .add_transport(Arc::new(TcpTransport::new()))
-        .add_transport(Arc::new(UdpTransport::new()))
-        .build(options)
+        .add_transport(Arc::new(UdpTransport::new()));
+    #[cfg(feature = "realtime-preview")]
+    let builder = {
+        use lp2ln_core_v2::transport::quic::{QuicTransport, QuicTransportOptions};
+        options = options.with_listen("quic", "0.0.0.0:0".parse()?);
+        builder.add_transport(Arc::new(QuicTransport::new_listener(None, QuicTransportOptions {
+            enable_realtime_flows: true, ..Default::default()
+        })))
+    };
+    let mut node = builder.build(options)
         .context("failed to build LP2LN node")?;
     runtime
         .block_on(node.start())
@@ -157,6 +167,19 @@ fn snapshot(native: &NativeNode) -> Value {
         })
         .collect::<Vec<_>>();
 
+    let discovery = native.known_peers.lock().map(|book| book.snapshot()).unwrap_or_default();
+    #[cfg(feature = "voice-preview")]
+    let discovery = {
+        let mut merged = discovery;
+        if let Some(entries)=merged.get_mut("addresses").and_then(Value::as_array_mut) {
+            let mut recent:Vec<_>=native.node.lan_dial_hints(128).into_iter()
+                .map(|(peer,proto,addr)| json!({"peerId":peer.as_str(),"protocol":proto,"address":addr.to_string()})).collect();
+            recent.append(entries);
+            recent.truncate(256);
+            *entries=recent;
+        }
+        merged
+    };
     json!({
         "ok": true,
         "lifecycle": lifecycle,
@@ -170,7 +193,7 @@ fn snapshot(native: &NativeNode) -> Value {
         "lastError": health.last_error.unwrap_or_default(),
         "sessions": session_values,
         "storage": files::state(native),
-        "discovery": native.known_peers.lock().map(|book| book.snapshot()).unwrap_or_default(),
+        "discovery": discovery,
         "bootstrapWarning": native.bootstrap_warning,
         "chat": native.chat_store.snapshot(),
     })
@@ -181,6 +204,8 @@ fn stop_node() -> Result<Value> {
         .lock()
         .map_err(|_| anyhow::anyhow!("LP2LN state lock is poisoned"))?;
     if let Some(native) = slot.take() {
+        #[cfg(feature = "realtime-preview")]
+        realtime::clear_handles();
         for task in [&native.discovery_task, &native.sharing_task, &native.chat_task] {
             if let Some(task) = task.lock().ok().and_then(|mut task| task.take()) {
                 task.abort();

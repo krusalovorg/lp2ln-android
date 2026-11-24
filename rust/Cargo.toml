@@ -8,6 +8,10 @@ publish = false
 name = "lp2ln_android"
 crate-type = ["cdylib"]
 
+[features]
+# Requires a checked-out Core with the realtime Flow preview API.
+realtime-preview = []
+
 [dependencies]
 anyhow = "1"
 jni = "0.21"
@@ -24,3 +28,8 @@ lto = "thin"
 opt-level = "s"
 panic = "abort"
 strip = true
+
+
+[patch.crates-io]
+# The pinned Core's workspace-level patch does not apply when built as a dependency.
+h3-quinn = { git = "https://github.com/krusalovorg/lp2ln.git", rev = "65925aaf9b8faabfba4f9eaf607ac5eb8860e0cc" }

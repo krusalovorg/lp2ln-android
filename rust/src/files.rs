@@ -455,12 +455,14 @@ mod tests {
     pub(super) fn test_node_with_storage(
         directory: &Path, routed_signatures: bool, content: bool, dht: bool, quota: usize,
     ) -> (NativeNode, std::net::SocketAddr) {
-        use lp2ln_core_v2::{db::P2PDatabase, node::{NodeBuilder, NodeOptions}, transport::tcp::TcpTransport};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        use lp2ln_core_v2::{
+            db::P2PDatabase,
+            event_core::prelude::{CoreEvent, TransportEvent},
+            node::{NodeBuilder, NodeOptions},
+            transport::tcp::TcpTransport,
+        };
         let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
-        let mut options = NodeOptions::empty().with_listen("tcp", address);
+        let mut options = NodeOptions::empty().with_listen("tcp", "127.0.0.1:0".parse().unwrap());
         options.logger_options = None;
         options.lan_discovery.enabled = false;
         options.debug_server.enabled = false;
@@ -474,7 +476,19 @@ mod tests {
         }
         let mut node = NodeBuilder::new().db(Arc::new(P2PDatabase::new(directory.to_str().unwrap()).unwrap()))
             .add_transport(Arc::new(TcpTransport::new())).build(options).unwrap();
-        runtime.block_on(node.start()).unwrap();
+        let mut events = node.core_bus().subscribe_events();
+        let address = runtime.block_on(async {
+            node.start().await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let CoreEvent::Transport(TransportEvent::Ready(ready)) = events.recv().await.unwrap() {
+                        if let Some(address) = ready.listen_addr {
+                            break address;
+                        }
+                    }
+                }
+            }).await.expect("test TCP listener must be ready")
+        });
         let node = Arc::new(node);
         let known_peers = Arc::new(Mutex::new(crate::peers::PeerAddressBook::open(directory, node.peer_id())));
         let file_index = Arc::new(FileIndex::new(directory));
