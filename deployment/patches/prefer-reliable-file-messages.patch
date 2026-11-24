@@ -1,0 +1,145 @@
+--- a/crates/lp2ln-core-v2/src/router/router.rs
++++ b/crates/lp2ln-core-v2/src/router/router.rs
+@@ -267,9 +267,13 @@
+         &self,
+         peer_id: &PeerId,
+         bulk_needs_reliable: bool,
++        prefer_reliable: bool,
+     ) -> Option<Arc<dyn Session + Send + Sync>> {
+         if bulk_needs_reliable {
+             self.reliable_session_for(peer_id)
++        } else if prefer_reliable {
++            self.reliable_session_for(peer_id).or_else(||
++                SessionSelector::best_session_for_peer(self.session_manager.as_ref(), peer_id))
+         } else {
+             SessionSelector::best_session_for_peer(self.session_manager.as_ref(), peer_id)
+         }
+@@ -286,6 +290,11 @@
+             anyhow::anyhow!("internal: request_id missing after prepare_outgoing")
+         })?;
+         let is_control_packet = NetworkControlPayload::is_likely_control_packet(&packet.data);
++        // Android file offers and delivery acknowledgments share this protocol.
++        // Prefer retransmitting links on EVERY hop; a recently active UDP
++        // session can still silently discard application packets behind NAT.
++        // Keep UDP usable when no reliable link to that peer exists.
++        let prefer_reliable = packet.protocol_id == Some(0x4c46);
+         let in_nodes = packet.nodes.iter().any(|n| n == peer_id.as_str());
+         if in_nodes || exclude_from.as_ref() == Some(&peer_id) {
+             return Err(anyhow::anyhow!(
+@@ -315,7 +324,7 @@
+             ));
+         }
+ 
+-        if let Some(session) = self.select_session_for(&peer_id, bulk_needs_reliable) {
++        if let Some(session) = self.select_session_for(&peer_id, bulk_needs_reliable, prefer_reliable) {
+             let session_id = SessionId::from(session.id().to_string());
+             let wire = encode_packet(packet)?;
+             match session.send_wire(wire).await {
+@@ -393,7 +402,7 @@
+         let mut any_ok = false;
+         let mut last_err = None;
+         for neighbor in candidates {
+-            if let Some(session) = self.select_session_for(&neighbor, bulk_needs_reliable) {
++            if let Some(session) = self.select_session_for(&neighbor, bulk_needs_reliable, prefer_reliable) {
+                 let session_id = SessionId::from(session.id().to_string());
+                 match session.send_wire(wire.clone()).await {
+                     Ok(bytes) => {
+@@ -609,3 +618,98 @@
+         MetricsProvider::total_sessions_count(self.session_manager.as_ref())
+     }
+ }
++
++
++#[cfg(test)]
++mod file_key_routing_tests {
++    use super::*;
++    use crate::crypto::NodeKeypair;
++    use crate::packet_processor::{PacketProcessor, ProcessAction};
++    use crate::peer_score::{PeerScoreStore, PeerScoreWeights};
++
++    struct NoopProcessor;
++    #[async_trait]
++    impl PacketProcessor for NoopProcessor {
++        async fn process(&self, _: IncomingPacket, _: Arc<Router>) -> ProcessAction {
++            ProcessAction::Delivered
++        }
++    }
++
++    struct CountingSession {
++        id: &'static str,
++        peer: String,
++        kind: LinkKind,
++        sent: Arc<AtomicU64>,
++    }
++
++    #[async_trait]
++    impl Session for CountingSession {
++        fn id(&self) -> &str { self.id }
++        fn peer_id(&self) -> Option<&str> { Some(&self.peer) }
++        fn kind(&self) -> LinkKind { self.kind }
++        async fn send(&self, _: Packet) -> Result<u64> {
++            self.sent.fetch_add(1, Ordering::Relaxed);
++            Ok(1)
++        }
++        async fn send_wire(&self, _: Vec<u8>) -> Result<u64> {
++            self.sent.fetch_add(1, Ordering::Relaxed);
++            Ok(1)
++        }
++        async fn close(&self) -> Result<()> { Ok(()) }
++        fn spawn_reader(self: Arc<Self>, _: mpsc::Sender<IncomingPacket>) {}
++    }
++
++    async fn routed_counts(protocol: u16, direct: bool, with_tcp: bool) -> (u64, u64) {
++        let author = NodeKeypair::generate();
++        let recipient = NodeKeypair::generate();
++        let relay = NodeKeypair::generate();
++        let next_peer = if direct { recipient.peer_id() } else { relay.peer_id() };
++        let manager = Arc::new(SessionManager::new(Arc::new(PeerScoreStore::new()), PeerScoreWeights::default()));
++        let tcp = Arc::new(AtomicU64::new(0));
++        let udp = Arc::new(AtomicU64::new(0));
++        if with_tcp {
++            manager.register(next_peer.into(), "key-test-tcp".into(), Arc::new(CountingSession {
++                id: "key-test-tcp", peer: next_peer.to_owned(), kind: LinkKind::DirectTcp, sent: tcp.clone(),
++            }));
++            // The old selector deterministically chooses UDP in this case.
++            manager.update_metrics(&"key-test-tcp".into(), |metrics| metrics.is_degraded = true);
++        }
++        manager.register(next_peer.into(), "key-test-udp".into(), Arc::new(CountingSession {
++            id: "key-test-udp", peer: next_peer.to_owned(), kind: LinkKind::DirectUdp, sent: udp.clone(),
++        }));
++        let (router, _incoming) = Router::new(manager, Arc::new(NoopProcessor),
++            Some(Arc::new(author.signing_key().clone())), author.peer_id(), None);
++        router.send_to_peer(recipient.peer_id().into(), Packet {
++            signature: None, sender: author.peer_id().to_owned(), receiver: recipient.peer_id().to_owned(),
++            data: b"file key or acknowledgment".to_vec(), nodes: vec![], max_hops: 8,
++            request_id: None, protocol_id: Some(protocol), chunk_stream_id: None,
++            chunk_index: None, total_chunks: None,
++        }, None).await.unwrap();
++        (tcp.load(Ordering::Relaxed), udp.load(Ordering::Relaxed))
++    }
++
++    #[tokio::test]
++    async fn file_key_prefers_tcp_for_recipient_with_higher_ranked_udp() {
++        assert_eq!(routed_counts(0x4c46, true, true).await, (1, 0));
++    }
++
++    #[tokio::test]
++    async fn file_key_prefers_tcp_for_intermediate_hop() {
++        assert_eq!(routed_counts(0x4c46, false, true).await, (1, 0));
++    }
++
++    #[tokio::test]
++    async fn file_key_can_use_udp_when_recipient_has_no_reliable_link() {
++        assert_eq!(routed_counts(0x4c46, true, false).await, (0, 1));
++    }
++
++    #[tokio::test]
++    async fn file_key_can_use_udp_when_relay_has_no_reliable_link() {
++        assert_eq!(routed_counts(0x4c46, false, false).await, (0, 1));
++    }
++
++    #[tokio::test]
++    async fn other_protocols_keep_their_session_selection() {
++        assert_eq!(routed_counts(0x1234, true, true).await, (0, 1));
++    }
++}

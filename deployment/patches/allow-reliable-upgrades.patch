@@ -1,0 +1,102 @@
+--- a/crates/lp2ln-core-v2/src/node/incoming_sessions.rs
++++ b/crates/lp2ln-core-v2/src/node/incoming_sessions.rs
+@@ -188,7 +188,11 @@
+         if let Some(peer_id) = session.peer_id() {
+             let pid = PeerId::from(peer_id.to_string());
+             let already_connected = session_manager.is_connected_to_peer(&pid);
+-            if already_connected {
++            // An existing UDP path must not prevent a reliable connection for
++            // the same authenticated peer. This adds a transport, not a peer.
++            let reliable_upgrade = already_connected && session.kind().is_reliable()
++                && session_manager.get_all_for_peer(&pid).iter().all(|s| !s.kind().is_reliable());
++            if already_connected && !reliable_upgrade {
+                 crate::debug!(
+                     "[NodeRuntime] Reject duplicate incoming session from {}",
+                     pid
+@@ -256,7 +260,7 @@
+                 fairness_window_started_ms = now;
+             }
+             if let Some(until) = recent_redirect_until.get(&pid).copied() {
+-                if now < until {
++                if now < until && !reliable_upgrade {
+                     send_discovery_redirect_and_close(
+                         &router_for_incoming,
+                         session.clone(),
+@@ -294,6 +298,7 @@
+                 last_bootstrap_reseed_ms: 0,
+                 now_ms: now,
+             };
++            if !reliable_upgrade {
+             if let AdmissionDecision::Redirect { .. } = SmartMeshPlanner.evaluate_incoming(
+                 &admission_snapshot,
+                 &PeerCandidate {
+@@ -333,6 +338,7 @@
+                 );
+                 continue;
+             }
++            }
+             if global_accepts_in_window >= GLOBAL_ACCEPTS_PER_SEC {
+                 crate::debug!(
+                     "[NodeRuntime] Redirect incoming session from {}: global accept budget",
+@@ -672,3 +678,61 @@
+         assert!(s3.was_closed());
+     }
+ }
++
++
++#[cfg(test)]
++mod reliable_upgrade_tests {
++    use super::*;
++    use async_trait::async_trait;
++    use std::sync::atomic::{AtomicBool, Ordering};
++    use crate::crypto::NodeKeypair;
++    use crate::packet_processor::{PacketProcessor, ProcessAction};
++    use crate::peer_score::{PeerConnectionPolicy, PeerScoreStore, PeerScoreWeights};
++    use crate::sessions::LinkKind;
++
++    struct TestSession { id: &'static str, peer: String, kind: LinkKind, closed: AtomicBool }
++    #[async_trait]
++    impl Session for TestSession {
++        fn id(&self) -> &str { self.id }
++        fn peer_id(&self) -> Option<&str> { Some(&self.peer) }
++        fn kind(&self) -> LinkKind { self.kind }
++        async fn send(&self, _: Packet) -> anyhow::Result<u64> { Ok(1) }
++        async fn send_wire(&self, _: Vec<u8>) -> anyhow::Result<u64> { Ok(1) }
++        async fn close(&self) -> anyhow::Result<()> { self.closed.store(true, Ordering::Relaxed); Ok(()) }
++        fn spawn_reader(self: Arc<Self>, _: tokio::sync::mpsc::Sender<IncomingPacket>) {}
++    }
++    struct NoopProcessor;
++    #[async_trait]
++    impl PacketProcessor for NoopProcessor {
++        async fn process(&self, _: IncomingPacket, _: Arc<Router>) -> ProcessAction { ProcessAction::Delivered }
++    }
++
++    #[tokio::test]
++    async fn udp_peer_can_add_tcp_at_capacity_but_duplicate_tcp_is_rejected() {
++        let key = NodeKeypair::generate();
++        let peer = NodeKeypair::generate().peer_id().to_owned();
++        let scores = Arc::new(PeerScoreStore::new());
++        let weights = PeerScoreWeights::default();
++        let manager = Arc::new(SessionManager::new(scores.clone(), weights.clone()));
++        let make = |id, kind| Arc::new(TestSession { id, peer: peer.clone(), kind, closed: AtomicBool::new(false) });
++        manager.register(peer.as_str().into(), "upgrade-udp".into(), make("upgrade-udp", LinkKind::DirectUdp));
++        let (router, _rx) = Router::new(manager.clone(), Arc::new(NoopProcessor),
++            Some(Arc::new(key.signing_key().clone())), key.peer_id(), None);
++        let (incoming_tx, mut incoming_rx) = tokio::sync::mpsc::channel(4);
++        let (packets_tx, _packets_rx) = tokio::sync::mpsc::channel(4);
++        let tcp = make("upgrade-tcp", LinkKind::DirectTcp);
++        let duplicate = make("duplicate-tcp", LinkKind::DirectTcp);
++        incoming_tx.send(tcp.clone() as Arc<dyn Session>).await.unwrap();
++        incoming_tx.send(duplicate.clone() as Arc<dyn Session>).await.unwrap();
++        drop(incoming_tx);
++        let _ = run_incoming_session_handler(tokio_util::sync::CancellationToken::new(), &mut incoming_rx,
++            manager.clone(), Arc::new(router), key.peer_id().to_owned(),
++            Arc::new(RwLock::new(PeerConnectionPolicy { min_active_peers: 1, target_active_peers: 1, max_active_peers: 1 })),
++            Arc::new(PeerCatalog::new()), scores, weights, NodeRole::Regular,
++            TopologyTuning::default(), 0.0, packets_tx).await;
++        assert!(!tcp.closed.load(Ordering::Relaxed), "TCP upgrade was rejected because a UDP peer existed");
++        assert!(duplicate.closed.load(Ordering::Relaxed), "Duplicate TCP must still be rejected");
++        assert_eq!(manager.distinct_peer_count(), 1);
++        assert!(manager.get_all_for_peer(&peer.as_str().into()).iter().any(|s| s.kind().is_reliable()));
++    }
++}

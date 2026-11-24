@@ -238,7 +238,7 @@ pub fn begin(path: String, name: String, retry_id: String) -> Result<Value> {
             let _ = fs::remove_file(format!("{path}.preview"));
         }
         match result {
-            Ok(Ok(entry)) => progress(json!({"busy":false, "name":entry["name"], "stage":"Файл сохранён на другом узле", "done":1, "total":1})),
+            Ok(Ok(entry)) => progress(json!({"busy":false, "name":entry["name"], "fileId":entry["id"], "stage":"Файл сохранён на другом узле", "done":1, "total":1})),
             Ok(Err(error)) => progress(json!({"busy":false, "name":name, "error":format!("{error:#}")})),
             Err(_) => progress(json!({"busy":false, "name":name, "error":"Ошибка обработки файла"})),
         }
@@ -411,18 +411,22 @@ mod tests {
         let known_peers = Arc::new(Mutex::new(crate::peers::PeerAddressBook::open(directory, node.peer_id())));
         let file_index = Arc::new(FileIndex::new(directory));
         let task = runtime.spawn(crate::sharing::listen(node.clone(), file_index.clone()));
+        let chat_store = Arc::new(crate::chat::ChatStore::new(directory));
+        let chat_task = runtime.spawn(crate::chat::listen(node.clone(), chat_store.clone()));
         (NativeNode { runtime, node, data_directory: directory.to_string_lossy().into_owned(),
             started_at: std::time::Instant::now(), known_peers, discovery_task: Mutex::new(None),
-            sharing_task: Mutex::new(Some(task)), bootstrap_warning: None, file_index }, address)
+            sharing_task: Mutex::new(Some(task)), bootstrap_warning: None, file_index,
+            chat_store, chat_task: Mutex::new(Some(chat_task)) }, address)
     }
 
     pub(super) fn stop_test_node(native: &NativeNode) {
-        for task in [&native.discovery_task, &native.sharing_task] {
+        for task in [&native.discovery_task, &native.sharing_task, &native.chat_task] {
             if let Some(task) = task.lock().unwrap().take() {
                 task.abort();
                 let _ = native.runtime.block_on(task);
             }
         }
+        native.chat_store.stop();
         native.runtime.block_on(native.node.stop()).unwrap();
     }
 
@@ -503,6 +507,260 @@ mod tests {
         assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
         fs::remove_dir_all(root).unwrap();
     }
+    // Sends only generated capabilities; no file contents are uploaded to the
+    // live nodes. Separate bootstraps also exercise the hop between two relays.
+    #[test]
+    #[ignore = "requires LP2LN_TEST_BOOTSTRAP; sends generated keys through a live network"]
+    fn key_delivery_and_acknowledgment_through_live_relays() {
+        let bootstrap = std::env::var("LP2LN_TEST_BOOTSTRAP").expect("Set LP2LN_TEST_BOOTSTRAP");
+        let second = std::env::var("LP2LN_TEST_SECOND_BOOTSTRAP").unwrap_or_else(|_| bootstrap.clone());
+        let root = std::env::temp_dir().join(format!("lp2ln-live-sharing-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        let (sender, _) = test_node(&root.join("sender"), true);
+        let (receiver, _) = test_node(&root.join("receiver"), true);
+        let result: Result<()> = sender.runtime.block_on(async {
+            sender.node.connect("tcp", bootstrap.parse()?).await?;
+            receiver.node.connect("tcp", second.parse()?).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while sender.node.active_peer_count() == 0 || receiver.node.active_peer_count() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }).await.context("Live relay connections did not become active")?;
+            for round in 0..3 {
+                for (from, to) in [(&sender, &receiver), (&receiver, &sender)] {
+                    let id = content_id_hex(&generate_key());
+                    let key = content_id_hex(&generate_key());
+                    let capability = json!({"id":id,"key":key,"name":"delivery-check.txt",
+                        "size":0,"providers":[]});
+                    println!("Live key delivery round {round}: {} -> {}", from.node.peer_id(), to.node.peer_id());
+                    let ack = crate::sharing::send(&from.node, to.node.peer_id(), capability).await?;
+                    anyhow::ensure!(ack["path"] == "relay", "Delivery bypassed the live relay");
+                    let inbox = to.file_index.read()?;
+                    let entry = inbox.iter().find(|entry| entry["id"] == id).context("Key missing from inbox")?;
+                    anyhow::ensure!(entry["key"] == key && entry["receivedFrom"] == from.node.peer_id(),
+                        "Received capability does not match sender");
+                }
+            }
+            Ok(())
+        });
+        stop_test_node(&sender);
+        stop_test_node(&receiver);
+        drop((sender, receiver));
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires LP2LN_TEST_BOOTSTRAP and LP2LN_TEST_RECIPIENT; sends a small test file to a real recipient"]
+    fn send_test_file_to_live_recipient() {
+        let bootstrap = std::env::var("LP2LN_TEST_BOOTSTRAP").expect("Set LP2LN_TEST_BOOTSTRAP");
+        let recipient = std::env::var("LP2LN_TEST_RECIPIENT").expect("Set LP2LN_TEST_RECIPIENT");
+        let key_only = std::env::var("LP2LN_TEST_KEY_ONLY").as_deref() == Ok("1");
+        assert!(crate::sharing::valid_peer(&recipient), "Invalid recipient Peer ID");
+        let root = std::env::temp_dir().join(format!("lp2ln-live-recipient-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        crate::start_node(root.join("node").to_string_lossy().into_owned(), bootstrap).unwrap();
+        let native = get_native().unwrap();
+        let result = (|| -> Result<()> {
+            println!("Test sender: {}; recipient: {recipient}", native.node.peer_id());
+            native.runtime.block_on(async {
+                if let Ok(address) = std::env::var("LP2LN_TEST_UDP_BOOTSTRAP") {
+                    native.node.connect("udp", address.parse()?).await?;
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    while native.node.active_peer_count() == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }).await.context("No authenticated session with the live network")?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            let source = root.join("delivery-check.txt");
+            fs::write(&source, format!("LP2LN key delivery check.\nGenerated at Unix time {}.\n",
+                SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()))?;
+            let name = if key_only { "lp2ln-key-check.txt" } else { "lp2ln-delivery-check.txt" };
+            let entry = import(&native, source.to_str().context("Invalid test directory")?, name)?;
+            let uploaded = if key_only { entry } else { publish(&native, entry)? };
+            let id = uploaded["id"].as_str().context("Missing test file ID")?;
+            println!("Sending test key; file replicated: {}", !key_only);
+            let capability = share_capability(&native, id)?;
+            let ack = native.runtime.block_on(async {
+                let _ = ensure_file_path(&native, &[recipient.clone()]).await;
+                crate::sharing::send(&native.node, &recipient, capability).await
+            })?;
+            println!("Recipient acknowledged test key: {ack}");
+            Ok(())
+        })();
+        if result.is_err() {
+            println!("Sender sessions: {:?}", native.node.debug_sessions());
+        }
+        crate::stop_node().unwrap();
+        drop(native);
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires LP2LN_TEST_BOOTSTRAP; waits for an invitation from a live sender"]
+    fn receive_test_key_from_live_sender() {
+        let bootstrap = std::env::var("LP2LN_TEST_BOOTSTRAP").expect("Set LP2LN_TEST_BOOTSTRAP");
+        let sender = std::env::var("LP2LN_TEST_RECIPIENT").expect("Set LP2LN_TEST_RECIPIENT to the sender Peer ID");
+        let root = std::env::temp_dir().join(format!("lp2ln-live-inbox-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        let (native, _) = test_node(&root.join("node"), true);
+        let result = native.runtime.block_on(async {
+            native.node.connect("tcp", bootstrap.parse()?).await?;
+            tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                while native.node.active_peer_count() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }).await.context("No authenticated session with the live network")?;
+            println!("RECEIVE_INVITATION lp2ln://peer/{}", native.node.peer_id());
+            tokio::time::timeout(std::time::Duration::from_secs(300), async {
+                loop {
+                    if let Some(entry) = native.file_index.read()?.into_iter()
+                        .find(|entry| entry["receivedFrom"] == sender) {
+                        println!("Received test key from the expected sender: name={}, size={}",
+                            entry["name"], entry["size"]);
+                        // Give the listener time to send the delivery acknowledgment.
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        return Ok::<_, anyhow::Error>(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                }
+            }).await.context("No invitation received from the expected sender")?
+        });
+        if result.is_err() { println!("Receiver sessions: {:?}", native.node.debug_sessions()); }
+        stop_test_node(&native);
+        drop(native);
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
+    #[test]
+    fn chat_messages_and_acknowledgments_cross_a_relay_and_retries_do_not_duplicate_history() {
+        let root = std::env::temp_dir().join(format!("lp2ln-chat-relay-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        let (relay, address) = test_node(&root.join("relay"), false);
+        let (sender, _) = test_node(&root.join("sender"), true);
+        let (receiver, _) = test_node(&root.join("receiver"), true);
+        sender.runtime.block_on(async {
+            sender.node.connect("tcp", address).await.unwrap();
+            receiver.node.connect("tcp", address).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while sender.node.active_peer_count() == 0 || receiver.node.active_peer_count() == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }).await.unwrap();
+        });
+        crate::chat::probe(&sender, receiver.node.peer_id()).unwrap();
+        sender.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while !sender.chat_store.snapshot()["presence"].as_array().unwrap().iter()
+                    .any(|p| p["peerId"] == receiver.node.peer_id() && p["status"] == "online") {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            }).await.unwrap();
+        });
+        for (from, to, text) in [(&sender, &receiver, "Привет с другого узла 👋"), (&receiver, &sender, "Сообщение получено!")] {
+            let queued = crate::chat::enqueue(from, to.node.peer_id(), text, "").unwrap();
+            let id = queued["message"]["id"].as_str().unwrap();
+            from.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while from.chat_store.read().unwrap().iter().find(|m| m["id"] == id).unwrap()["status"] != "delivered" {
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    }
+                }).await.unwrap();
+                crate::sharing::send_packet(&from.node, to.node.peer_id(), json!({"kind":"chat","v":1,"id":id,"text":text}), 1).await.unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            });
+            let inbox = to.chat_store.read().unwrap();
+            assert_eq!(inbox.iter().filter(|m| m["id"] == id && m["outgoing"] == false).count(), 1);
+            assert_eq!(inbox.iter().find(|m| m["id"] == id).unwrap()["text"], text);
+            assert!(to.file_index.read().unwrap().is_empty(), "Chat messages must not create file invitations");
+        }
+        let offline = lp2ln_core_v2::crypto::NodeKeypair::generate();
+        crate::chat::probe(&sender, offline.peer_id()).unwrap();
+        sender.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(11), async {
+                while !sender.chat_store.snapshot()["presence"].as_array().unwrap().iter()
+                    .any(|p| p["peerId"] == offline.peer_id() && p["status"] == "offline") {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }).await.unwrap();
+        });
+        for node in [&sender, &receiver, &relay] { stop_test_node(node); }
+        drop((sender, receiver, relay));
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires LP2LN_TEST_BOOTSTRAP and LP2LN_TEST_RECIPIENT; exchanges chat messages with a real phone"]
+    fn chat_round_trip_with_live_phone() {
+        let bootstrap = std::env::var("LP2LN_TEST_BOOTSTRAP").expect("Set LP2LN_TEST_BOOTSTRAP");
+        let recipient = std::env::var("LP2LN_TEST_RECIPIENT").expect("Set LP2LN_TEST_RECIPIENT");
+        let root = std::env::temp_dir().join(format!("lp2ln-live-chat-{}", content_id_hex(&generate_key())));
+        fs::create_dir(&root).unwrap();
+        crate::start_node(root.join("node").to_string_lossy().into_owned(), bootstrap).unwrap();
+        let native = get_native().unwrap();
+        let result: Result<()> = (|| {
+            println!("CHAT_PEER lp2ln://peer/{}", native.node.peer_id());
+            native.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(60), async {
+                    while native.node.active_peer_count() == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }).await?;
+                Ok::<_, anyhow::Error>(())
+            })?;
+            crate::chat::probe(&native, &recipient)?;
+            native.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(12), async {
+                    while !native.chat_store.snapshot()["presence"].as_array().unwrap().iter()
+                        .any(|p| p["peerId"] == recipient && p["status"] == "online") {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }).await.context("Phone did not respond to the presence probe")
+            })?;
+            println!("PHONE_PRESENCE_ONLINE");
+            let queued = crate::chat::enqueue(&native, &recipient, "Привет 👋 P2P-чат работает. Ответь на это сообщение, чтобы проверить обе стороны.", "")?;
+            let id = queued["message"]["id"].as_str().context("Missing message ID")?;
+            native.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(35), async {
+                    loop {
+                        let history = native.chat_store.read()?;
+                        let sent = history.iter().find(|m| m["id"] == id).context("Missing outgoing message")?;
+                        if sent["status"] == "delivered" { break; }
+                        anyhow::ensure!(sent["status"] != "failed", "Phone did not acknowledge the chat message");
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    println!("PHONE_CHAT_DELIVERED");
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+                tokio::time::timeout(std::time::Duration::from_secs(240), async {
+                    loop {
+                        if native.chat_store.read()?.iter().any(|m| m["peerId"] == recipient && m["outgoing"] == false) {
+                            println!("PHONE_CHAT_REPLY_RECEIVED");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }).await??;
+                Ok(())
+            })
+        })();
+        crate::stop_node().unwrap();
+        drop(native);
+        assert!(root.canonicalize().unwrap().starts_with(std::env::temp_dir().canonicalize().unwrap()));
+        fs::remove_dir_all(root).unwrap();
+        result.unwrap();
+    }
+
     #[test]
     fn encrypted_manifest_and_multiple_chunks_round_trip() {
         let store = lp2ln_core_v2::storage::MemoryBlockStore::new();
@@ -553,6 +811,7 @@ mod tests {
             &root.join("sender"), sender.peer_id())));
         let native = NativeNode { runtime, node: Arc::new(sender), started_at: std::time::Instant::now(),
             file_index: Arc::new(FileIndex::new(root.join("sender"))), sharing_task: Mutex::new(None),
+            chat_store: Arc::new(crate::chat::ChatStore::new(&root.join("sender"))), chat_task: Mutex::new(None),
             known_peers, discovery_task: Mutex::new(None), bootstrap_warning: None,
             data_directory: root.join("sender").to_string_lossy().into_owned() };
         let original = (0..CHUNK_SIZE + 73).map(|i| (i % 251) as u8).collect::<Vec<_>>();

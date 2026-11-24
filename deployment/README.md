@@ -25,3 +25,19 @@ Runtime deployment should use a dedicated data directory, bounded resources,
 rotating logs and a restart policy. Expose only peer transport ports. Keep health,
 debug and application IPC endpoints private. Validate configuration using
 `lp2lnd config check -o <options-file>` before starting the service.
+
+The patches in `patches/` record targeted changes for the separate LP2LN core
+repository. They do not change the pinned Git dependency automatically. Apply
+them in the core checkout and publish/pin a tested revision when updating the
+Android dependency. The application channel `0x4c46` carries encrypted file
+invitations, chat messages and their delivery acknowledgments.
+
+`allow-reliable-upgrades.patch` lets a peer that already has only UDP sessions
+add a reliable session without counting as a new peer. It bypasses the new-peer
+admission redirect for this upgrade while still rejecting duplicate reliable
+sessions. Otherwise an apparently connected mobile peer can be unable to open
+the TCP channel needed to download a file.
+
+`prefer-reliable-file-messages.patch` prefers an available reliable session for
+this channel on every relay hop, while preserving a UDP fallback. This is a
+temporary delivery policy.

@@ -11,13 +11,13 @@ use tokio::sync::broadcast::error::RecvError;
 
 use crate::files::FileIndex;
 
-const PROTOCOL: u16 = 0x4c46;
+pub(crate) const PROTOCOL: u16 = 0x4c46;
 
 pub(crate) fn valid_peer(peer: &str) -> bool {
     peer.len() == 66 && PeerCryptoCache::new().verifying_key(peer).is_ok()
 }
 
-async fn send_packet(node: &NodeRuntime, recipient: &str, payload: Value, attempt: usize) -> Result<()> {
+pub(crate) async fn send_packet(node: &NodeRuntime, recipient: &str, payload: Value, attempt: usize) -> Result<()> {
     let router = node.router().context("Узел не запущен")?;
     let packet = Packet {
         signature: None, sender: node.peer_id().to_owned(), receiver: recipient.to_owned(),

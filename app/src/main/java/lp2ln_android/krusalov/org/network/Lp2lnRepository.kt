@@ -5,6 +5,22 @@ import org.json.JSONObject
 
 class Lp2lnRepository {
 
+    fun sendMessage(peerId: String, text: String, retryId: String = "") {
+        check(Lp2lnNativeBridge.isAvailable) { Lp2lnNativeBridge.unavailableReason }
+        val result = JSONObject(Lp2lnNativeBridge.nativeChatSend(peerId, text, retryId))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
+    fun markChatRead(peerId: String) {
+        val result = JSONObject(Lp2lnNativeBridge.nativeChatRead(peerId))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
+    fun probeChat(peerId: String) {
+        val result = JSONObject(Lp2lnNativeBridge.nativeChatProbe(peerId))
+        check(result.optBoolean("ok")) { result.optString("error") }
+    }
+
     fun thumbnail(id: String, destination: String) {
         val result = JSONObject(Lp2lnNativeBridge.nativeThumbnail(id, destination))
         check(result.optBoolean("ok")) { result.optString("error") }
@@ -116,6 +132,24 @@ class Lp2lnRepository {
             }
         }
         val transfer = storage?.optJSONObject("transfer") ?: JSONObject()
+        val chat = json.optJSONObject("chat")
+        val messagesJson = chat?.optJSONArray("messages")
+        val presenceJson = chat?.optJSONArray("presence")
+        val presence = buildMap {
+            if (presenceJson != null) for (index in 0 until presenceJson.length()) {
+                val peer = presenceJson.getJSONObject(index)
+                put(peer.getString("peerId"), ChatPresence(peer.optString("status", "unknown"), peer.optLong("lastSeen")))
+            }
+        }
+        val messages = buildList {
+            if (messagesJson != null) for (index in 0 until messagesJson.length()) {
+                val message = messagesJson.getJSONObject(index)
+                add(ChatMessage(message.getString("id"), message.getString("peerId"), message.getString("text"),
+                    message.getLong("createdAt"), message.optBoolean("outgoing"), message.getString("status"),
+                    message.optBoolean("read", true), message.optString("error").takeUnless { it.isBlank() || it == "null" },
+                    message.optString("name").takeUnless { it.isBlank() || it == "null" }))
+            }
+        }
         val discovery = json.optJSONObject("discovery")
         val addresses = discovery?.optJSONArray("addresses")
         val knownNodes = buildList {
@@ -125,6 +159,9 @@ class Lp2lnRepository {
             }
         }
         NetworkState(
+            messages = messages,
+            chatPresence = presence,
+            chatError = chat?.optString("error")?.takeUnless { it.isBlank() || it == "null" },
             knownNodes = knownNodes,
             discoveryError = discovery?.optString("error")?.takeUnless { it.isBlank() || it == "null" },
             bootstrapWarning = json.optString("bootstrapWarning").takeUnless { it.isBlank() || it == "null" },

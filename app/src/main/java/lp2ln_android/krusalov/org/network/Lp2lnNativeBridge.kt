@@ -19,4 +19,7 @@ internal object Lp2lnNativeBridge {
     external fun nativeShare(id: String, recipient: String): String
     external fun nativeDownload(id: String): String
     external fun nativeThumbnail(id: String, destination: String): String
+    external fun nativeChatSend(peerId: String, text: String, retryId: String): String
+    external fun nativeChatRead(peerId: String): String
+    external fun nativeChatProbe(peerId: String): String
 }

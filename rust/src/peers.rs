@@ -144,11 +144,18 @@ pub async fn maintain(node: Arc<NodeRuntime>, book: Arc<Mutex<PeerAddressBook>>)
                 node.register_known_peer_addr(peer.clone(), target.protocols[0].clone(), target.addr);
             }
         }
-        if node.active_peer_count() > 0 {
+        // UDP discovery alone does not provide a dependable path for keys,
+        // acknowledgments or file blocks. Keep restoring a reliable backbone
+        // even while apparently active UDP peers remain in the session table.
+        if node.debug_sessions().iter().any(|s| s.is_active && s.peer_id.is_some()
+            && matches!(s.protocol.as_str(), "tcp" | "quic" | "tunnel_tcp" | "relay")) {
             delay = Duration::from_secs(5);
             retry_at = Instant::now() + Duration::from_secs(10);
             continue;
         }
+        let targets: Vec<_> = if node.active_peer_count() > 0 {
+            targets.into_iter().filter(|t| t.protocols.iter().any(|p| p == "tcp")).collect()
+        } else { targets };
         if targets.is_empty() || Instant::now() < retry_at { continue; }
         let target = &targets[cursor % targets.len()];
         cursor = cursor.wrapping_add(1);

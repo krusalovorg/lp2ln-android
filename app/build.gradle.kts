@@ -13,8 +13,8 @@ android {
         manifestPlaceholders["appLabel"] = providers.gradleProperty("appLabel").getOrElse("@string/app_name")
         minSdk = 29
         targetSdk = 34
-        versionCode = 5
-        versionName = "1.2.2"
+        versionCode = 8
+        versionName = "1.3.1"
         // Inject a private endpoint at build time; never commit deployment addresses.
         val bootstrap = providers.gradleProperty("lp2lnBootstrap")
             .orElse(providers.environmentVariable("LP2LN_BOOTSTRAP"))
@@ -107,6 +107,10 @@ tasks.matching { it.name == "mergeReleaseJniLibFolders" }.configureEach {
 }
 
 dependencies {
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-video:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     implementation(libs.androidx.core.ktx)

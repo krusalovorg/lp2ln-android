@@ -26,7 +26,8 @@ import lp2ln_android.krusalov.org.network.PeerInvitation
 import lp2ln_android.krusalov.org.network.StoredFile
 
 @Composable
-fun ReceiveFileDialog(peerId: String, dismiss: () -> Unit) {
+fun ReceiveFileDialog(peerId: String, title: String = "Получить файл",
+    description: String = "Оставьте приложение открытым. Полученный файл появится в вашей библиотеке.", dismiss: () -> Unit) {
     val invitation = remember(peerId) { runCatching { PeerInvitation.encode(peerId) }.getOrNull() }
     val bitmap = remember(invitation) {
         invitation?.let { runCatching { BarcodeEncoder().encodeBitmap(it, BarcodeFormat.QR_CODE, 600, 600).asImageBitmap() }.getOrNull() }
@@ -36,14 +37,14 @@ fun ReceiveFileDialog(peerId: String, dismiss: () -> Unit) {
         Surface(shape = RoundedCornerShape(28.dp), color = Color.White) {
             Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Text("Получить файл", fontSize = 24.sp, fontWeight = FontWeight.SemiBold)
+                Text(title, fontSize = 24.sp, fontWeight = FontWeight.SemiBold)
                 Text("Покажите QR другу", color = MaterialTheme.colorScheme.onSurfaceVariant, fontSize = 15.sp)
                 if (bitmap != null) Image(bitmap, contentDescription = "QR вашего узла",
                     modifier = Modifier.fillMaxWidth().aspectRatio(1f).background(Color.White))
                 else CircularProgressIndicator(Modifier.padding(48.dp))
                 Text(peerId.take(10) + "…" + peerId.takeLast(8), fontSize = 13.sp,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
-                Text("Оставьте приложение открытым. Полученный файл появится в вашей библиотеке.",
+                Text(description,
                     fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 TextButton(onClick = { invitation?.let { clipboard.setText(AnnotatedString(it)) } },
                     enabled = invitation != null) { Text("Копировать адрес") }

@@ -35,6 +35,51 @@ class NetworkViewModel(
     val notice = _notice.asStateFlow()
     fun clearNotice() { _notice.value = null }
 
+    fun sendMessage(peerId: String, text: String, retryId: String = "", onQueued: (Boolean) -> Unit = {}) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    nodeMutex.withLock {
+                        repository.sendMessage(peerId, text.trim(), retryId)
+                        _state.value = repository.snapshot(_state.value.bootstrapAddress)
+                    }
+                }
+                onQueued(true)
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message ?: "Не удалось отправить сообщение"
+                onQueued(false)
+            }
+        }
+    }
+
+    fun markChatRead(peerId: String) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    nodeMutex.withLock {
+                        repository.markChatRead(peerId)
+                        _state.value = repository.snapshot(_state.value.bootstrapAddress)
+                    }
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                _notice.value = error.message ?: "История сообщений недоступна"
+            }
+        }
+    }
+
+    fun probeChat(peerId: String) {
+        viewModelScope.launch {
+            try {
+                withContext(Dispatchers.IO) { repository.probeChat(peerId) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                // Presence is advisory; delivery has its own acknowledgment.
+            }
+        }
+    }
+
     private val _image = MutableStateFlow(ImageViewState())
     val image = _image.asStateFlow()
 
@@ -89,8 +134,11 @@ class NetworkViewModel(
         }
     }
 
-    fun importFile(context: Context, uri: Uri) {
-        if (_fileBusy.value || _state.value.transfer.busy) return
+    fun importFile(context: Context, uri: Uri, recipient: String? = null, kind: String = "media") {
+        if (_fileBusy.value || _state.value.transfer.busy) {
+            _notice.value = "Дождитесь завершения передачи"
+            return
+        }
         _fileBusy.value = true
         viewModelScope.launch {
             try {
@@ -118,6 +166,17 @@ class NetworkViewModel(
                         nodeMutex.withLock {
                             repository.upload(staging.absolutePath, name)
                             handedOff = true
+                            if (recipient != null) {
+                                var transfer = repository.snapshot(_state.value.bootstrapAddress).transfer
+                                while (transfer.busy) {
+                                    delay(250)
+                                    transfer = repository.snapshot(_state.value.bootstrapAddress).transfer
+                                }
+                                val id = transfer.fileId.orEmpty()
+                                check(id.isNotBlank()) { transfer.error ?: "Вложение не сохранено" }
+                                repository.share(id, recipient)
+                                repository.sendMessage(recipient, "lp2ln-media/1/$kind/$id")
+                            }
                             _state.value = repository.snapshot(_state.value.bootstrapAddress)
                         }
                     } finally { if (!handedOff) {
@@ -128,7 +187,13 @@ class NetworkViewModel(
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 _notice.value = error.message ?: "Не удалось добавить файл"
-            } finally { _fileBusy.value = false }
+            } finally {
+                if (recipient != null &&
+                    uri.authority == "${context.packageName}.files" && uri.pathSegments.firstOrNull() == "recordings") {
+                    runCatching { context.contentResolver.delete(uri, null, null) }
+                }
+                _fileBusy.value = false
+            }
         }
     }
 

@@ -17,6 +17,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
@@ -38,6 +39,7 @@ import lp2ln_android.krusalov.org.ui.theme.Lp2lnandroidTheme
 import lp2ln_android.krusalov.org.ui.ReceiveFileDialog
 import lp2ln_android.krusalov.org.ui.SendFileDialog
 import lp2ln_android.krusalov.org.ui.ImageViewer
+import lp2ln_android.krusalov.org.ui.ChatScreen
 
 private val Blue = Color(0xFF3478F6)
 private val Secondary = Color(0xFF83858C)
@@ -45,14 +47,20 @@ private val DividerColor = Color(0xFFE9E9EE)
 private val Green = Color(0xFF26865D)
 
 class MainActivity : ComponentActivity() {
+    override fun onDestroy() {
+        NodeSession.release()
+        super.onDestroy()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent { Lp2lnandroidTheme { NetworkRoute() } }
+        val node = NodeSession.acquire()
+        setContent { Lp2lnandroidTheme { NetworkRoute(node) } }
     }
 }
 
 @Composable
-private fun NetworkRoute(viewModel: NetworkViewModel = viewModel()) {
+private fun NetworkRoute(viewModel: NetworkViewModel) {
     val context = LocalContext.current
     val state by viewModel.state.collectAsState()
     val fileBusy by viewModel.fileBusy.collectAsState()
@@ -75,7 +83,9 @@ private fun NetworkRoute(viewModel: NetworkViewModel = viewModel()) {
         onShare = viewModel::shareFile, onDownload = viewModel::downloadFile,
         onOpen = { if (it.isImage) { imageFile = it; viewModel.viewImage(context.applicationContext, it) }
             else viewModel.openFile(context.applicationContext, it) },
-        onPreview = { imageFile = it; viewModel.viewImage(context.applicationContext, it) })
+        onPreview = { imageFile = it; viewModel.viewImage(context.applicationContext, it) },
+        onAttach = { peer, uri, kind -> viewModel.importFile(context.applicationContext, uri, peer, kind) },
+        onSendMessage = viewModel::sendMessage, onChatRead = viewModel::markChatRead, onChatProbe = viewModel::probeChat)
     imageFile?.let { selected ->
         val file = state.files.find { it.id == selected.id } ?: selected
         ImageViewer(file, image, state.transfer,
@@ -93,8 +103,13 @@ private fun NetworkScreen(
     onShare: (StoredFile, String) -> Unit = { _, _ -> },
     onDownload: (StoredFile) -> Unit = {}, onOpen: (StoredFile) -> Unit = {},
     onPreview: (StoredFile) -> Unit = {},
+    onAttach: (String, android.net.Uri, String) -> Unit = { _, _, _ -> },
+    onSendMessage: (String, String, String, (Boolean) -> Unit) -> Unit = { _, _, _, queued -> queued(false) },
+    onChatRead: (String) -> Unit = {},
+    onChatProbe: (String) -> Unit = {},
 ) {
     var tab by rememberSaveable { mutableStateOf(initialTab) }
+    var chatOpen by rememberSaveable { mutableStateOf(false) }
     var search by rememberSaveable { mutableStateOf("") }
     var selectedFile by remember { mutableStateOf<StoredFile?>(null) }
     var sharingFile by remember { mutableStateOf<StoredFile?>(null) }
@@ -103,32 +118,20 @@ private fun NetworkScreen(
     val available = state.phase in listOf(ConnectionPhase.CONNECTED, ConnectionPhase.SEARCHING, ConnectionPhase.DEGRADED)
     val visibleFiles = remember(state.files, search) { state.files.filter { it.name.contains(search, ignoreCase = true) } }
     val snackbar = remember { SnackbarHostState() }
+    val chatState = rememberSaveableStateHolder()
     LaunchedEffect(notice) { if (notice != null) { snackbar.showSnackbar(notice); dismissNotice() } }
+    Box(Modifier.fillMaxSize()) {
     Scaffold(
         containerColor = MaterialTheme.colorScheme.background,
-        snackbarHost = { SnackbarHost(snackbar) },
-        bottomBar = {
-            Surface(color = Color.White) {
-                Column {
-                    Divider(color = DividerColor)
-                    Row(Modifier.fillMaxWidth().navigationBarsPadding().padding(top = 6.dp, bottom = 8.dp)) {
-                        listOf("Файлы", "Сеть").forEachIndexed { index, title ->
-                            val color = if (tab == index) Blue else Secondary
-                            Column(Modifier.weight(1f).clickable { tab = index }.padding(vertical = 6.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(5.dp)) {
-                                LineIcon(if (index == 0) "folder" else "network", color, Modifier.size(24.dp))
-                                Text(title, fontSize = 10.sp, fontWeight = FontWeight.Medium, color = color)
-                            }
-                        }
-                    }
-                }
-            }
-        },
+        snackbarHost = { SnackbarHost(snackbar, Modifier.padding(bottom = if (tab == 1 && chatOpen) 0.dp else 76.dp)) },
     ) { padding ->
+        if (tab == 1) chatState.SaveableStateProvider("chat") {
+            ChatScreen(state, onSendMessage, onChatRead, onAttach = onAttach, onFile = { if (it.isImage || it.availableLocally) onOpen(it) else onDownload(it) }, busy = busy, onProbe = onChatProbe, onConversationChanged = { chatOpen = it }, onNetwork = { tab = 2 },
+                modifier = Modifier.padding(padding).statusBarsPadding())
+        } else {
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding).statusBarsPadding(),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 24.dp),
+            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 90.dp),
             verticalArrangement = Arrangement.spacedBy(20.dp),
         ) {
             item {
@@ -192,7 +195,7 @@ private fun NetworkScreen(
                     }
                 }
                 if (!available) item {
-                    TextButton(onClick = { tab = 1 }, contentPadding = PaddingValues(0.dp)) { Text("Настроить подключение") }
+                    TextButton(onClick = { tab = 2 }, contentPadding = PaddingValues(0.dp)) { Text("Настроить подключение") }
                 }
                 item {
                     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -213,6 +216,32 @@ private fun NetworkScreen(
                 }
             } else item { NetworkDetails(state, busy, onRetry, onReconnect, { receiving = true }) }
         }
+        }
+    }
+            if (tab != 1 || !chatOpen) {
+            Surface(modifier = Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(horizontal = 16.dp, vertical = 6.dp),
+                color = Color.White, shape = RoundedCornerShape(32.dp), shadowElevation = 5.dp) {
+                Column {
+                    Row(Modifier.fillMaxWidth().padding(4.dp)) {
+                        listOf("Файлы", "Чаты", "Сеть").forEachIndexed { index, title ->
+                            val color = if (tab == index) Blue else Secondary
+                            Column(Modifier.weight(1f).background(if (tab == index) Blue.copy(alpha = .10f) else Color.Transparent, CircleShape).clickable { tab = index }.padding(vertical = 5.dp),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(5.dp)) {
+                                Box {
+                                    LineIcon(when (index) { 0 -> "folder"; 1 -> "chat"; else -> "network" }, color, Modifier.size(24.dp))
+                                    if (index == 1 && state.messages.any { !it.outgoing && !it.read }) {
+                                        Box(Modifier.align(Alignment.TopEnd).offset(x = 5.dp, y = (-2).dp)
+                                            .size(7.dp).background(Blue, CircleShape))
+                                    }
+                                }
+                                Text(title, fontSize = 10.sp, fontWeight = FontWeight.Medium, color = color)
+                            }
+                        }
+                    }
+                }
+            }
+            }
     }
     selectedFile?.let { file ->
         val clipboard = LocalClipboardManager.current
@@ -417,6 +446,12 @@ private fun LineIcon(kind: String, color: Color, modifier: Modifier = Modifier) 
                 }
                 drawPath(path, color, style = stroke)
             }
+            "chat" -> {
+                drawRoundRect(color, Offset(w * .1f, h * .13f), androidx.compose.ui.geometry.Size(w * .8f, h * .62f),
+                    androidx.compose.ui.geometry.CornerRadius(w * .16f), style = stroke)
+                drawLine(color, Offset(w * .25f, h * .75f), Offset(w * .18f, h * .93f), stroke.width)
+                drawLine(color, Offset(w * .18f, h * .93f), Offset(w * .46f, h * .75f), stroke.width)
+            }
             else -> {
                 val path = Path().apply {
                     moveTo(w * .2f, h * .06f); lineTo(w * .62f, h * .06f); lineTo(w * .83f, h * .28f)
@@ -469,7 +504,7 @@ private fun FilesPreview() { DemoPreview(0) }
 
 @androidx.compose.ui.tooling.preview.Preview(name = "Network", showBackground = true, widthDp = 393, heightDp = 851)
 @Composable
-private fun NetworkPreview() { DemoPreview(1) }
+private fun NetworkPreview() { DemoPreview(2) }
 
 @Composable
 private fun DemoPreview(tab: Int) {

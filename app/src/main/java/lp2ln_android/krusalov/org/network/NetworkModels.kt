@@ -36,6 +36,9 @@ data class NetworkState(
     val knownNodes: List<KnownNodeAddress> = emptyList(),
     val discoveryError: String? = null,
     val bootstrapWarning: String? = null,
+    val messages: List<ChatMessage> = emptyList(),
+    val chatError: String? = null,
+    val chatPresence: Map<String, ChatPresence> = emptyMap(),
 ) {
     companion object {
         val DEFAULT_BOOTSTRAP: String = lp2ln_android.krusalov.org.BuildConfig.LP2LN_BOOTSTRAP
@@ -57,3 +60,26 @@ data class FileTransfer(
     val done: Long = 0, val total: Long = 0, val error: String? = null,
     val fileId: String = "",
 )
+
+data class ChatMessage(
+    val id: String,
+    val peerId: String,
+    val text: String,
+    val createdAt: Long,
+    val outgoing: Boolean,
+    val status: String,
+    val read: Boolean = true,
+    val error: String? = null,
+    val senderName: String? = null,
+)
+
+data class ChatConversation(val peerId: String, val lastMessage: ChatMessage, val unreadCount: Int)
+
+data class ChatPresence(val status: String, val lastSeen: Long = 0)
+
+fun chatConversations(messages: List<ChatMessage>): List<ChatConversation> =
+    messages.groupBy { it.peerId }.map { (peer, history) ->
+        ChatConversation(peer, history.maxBy { it.createdAt }, history.count { !it.outgoing && !it.read })
+    }.sortedByDescending { it.lastMessage.createdAt }
+
+fun peerLabel(peer: String): String = peer.take(8) + "…" + peer.takeLast(6)

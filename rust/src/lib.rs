@@ -2,6 +2,7 @@ mod files;
 mod image_preview;
 mod peers;
 mod sharing;
+mod chat;
 use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -28,6 +29,8 @@ struct NativeNode {
     bootstrap_warning: Option<String>,
     file_index: Arc<files::FileIndex>,
     sharing_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    chat_store: Arc<chat::ChatStore>,
+    chat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 static NODE: OnceLock<Mutex<Option<Arc<NativeNode>>>> = OnceLock::new();
@@ -105,6 +108,8 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
     let discovery_task = runtime.spawn(peers::maintain(node.clone(), known_peers.clone()));
     let file_index = Arc::new(files::FileIndex::new(&data_directory));
     let sharing_task = runtime.spawn(sharing::listen(node.clone(), file_index.clone()));
+    let chat_store = Arc::new(chat::ChatStore::new(std::path::Path::new(&data_directory)));
+    let chat_task = runtime.spawn(chat::listen(node.clone(), chat_store.clone()));
     let native = Arc::new(NativeNode {
         runtime,
         node,
@@ -115,6 +120,8 @@ fn start_node(data_directory: String, bootstrap_address: String) -> Result<Value
         bootstrap_warning,
         file_index,
         sharing_task: Mutex::new(Some(sharing_task)),
+        chat_store,
+        chat_task: Mutex::new(Some(chat_task)),
     });
     let result = snapshot(&native);
     *slot = Some(native);
@@ -165,6 +172,7 @@ fn snapshot(native: &NativeNode) -> Value {
         "storage": files::state(native),
         "discovery": native.known_peers.lock().map(|book| book.snapshot()).unwrap_or_default(),
         "bootstrapWarning": native.bootstrap_warning,
+        "chat": native.chat_store.snapshot(),
     })
 }
 
@@ -173,12 +181,13 @@ fn stop_node() -> Result<Value> {
         .lock()
         .map_err(|_| anyhow::anyhow!("LP2LN state lock is poisoned"))?;
     if let Some(native) = slot.take() {
-        for task in [&native.discovery_task, &native.sharing_task] {
+        for task in [&native.discovery_task, &native.sharing_task, &native.chat_task] {
             if let Some(task) = task.lock().ok().and_then(|mut task| task.take()) {
                 task.abort();
                 let _ = native.runtime.block_on(task);
             }
         }
+        native.chat_store.stop();
         native
             .runtime
             .block_on(native.node.stop())
@@ -307,5 +316,40 @@ pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridg
         let (id, destination) = args?;
         let native = files::get_native()?;
         image_preview::fetch(&native, &id, &destination)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeChatSend(
+    mut env: JNIEnv, _class: JClass, peer: JString, text: JString, retry_id: JString,
+) -> jstring {
+    let args: Result<_> = (|| Ok((read_string(&mut env, peer)?, read_string(&mut env, text)?, read_string(&mut env, retry_id)?)))();
+    return_json(&mut env, || {
+        let (peer, text, retry_id) = args?;
+        let native = files::get_native()?;
+        chat::enqueue(&native, &peer, &text, &retry_id)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeChatRead(
+    mut env: JNIEnv, _class: JClass, peer: JString,
+) -> jstring {
+    let peer = read_string(&mut env, peer);
+    return_json(&mut env, || {
+        files::get_native()?.chat_store.mark_read(&peer?)?;
+        Ok(json!({"ok":true}))
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_lp2ln_1android_krusalov_org_network_Lp2lnNativeBridge_nativeChatProbe(
+    mut env: JNIEnv, _class: JClass, peer: JString,
+) -> jstring {
+    let peer = read_string(&mut env, peer);
+    return_json(&mut env, || {
+        let native = files::get_native()?;
+        chat::probe(&native, &peer?)?;
+        Ok(json!({"ok":true}))
     })
 }
