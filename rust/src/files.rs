@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use lp2ln_core_v2::storage::{
     content_id_from_hex, content_id_hex, encrypt::{decrypt_chunk, encrypt_chunk, generate_key},
-    manifest::{FileManifest, CODEC_RAW}, ContentId,
+    manifest::{FileManifest, CODEC_RAW}, BlockTransferService, ContentId,
 };
 use serde_json::{json, Value};
 use crate::{node_slot, NativeNode};
@@ -16,6 +16,11 @@ const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 // Small blocks also work through peers with conservative packet limits.
 const CHUNK_SIZE: usize = 256 * 1024;
 const DOWNLOAD_CONCURRENCY: usize = 4;
+const UPLOAD_CONCURRENCY: usize = 4;
+
+#[path = "file_sources.rs"]
+pub(crate) mod file_sources;
+use file_sources::{replica_peer, FileSources};
 static TRANSFER: OnceLock<Mutex<Value>> = OnceLock::new();
 fn transfer_slot() -> &'static Mutex<Value> {
     TRANSFER.get_or_init(|| Mutex::new(json!({"busy": false})))
@@ -91,7 +96,9 @@ pub(crate) async fn ensure_file_path(native: &NativeNode, providers: &[String]) 
         let _ = book.remember(native.node.peer_catalog().descriptors(), native.node.peer_id());
         book.targets().into_iter().filter(|t| t.protocols.iter().any(|p| p == "tcp")).collect::<Vec<_>>()
     };
-    targets.sort_by_key(|t| !t.peer_id_hint.as_ref().is_some_and(|peer| providers.iter().any(|p| p == peer.as_str())));
+    targets.sort_by_key(|t| t.peer_id_hint.as_ref()
+        .and_then(|peer| providers.iter().position(|p| p == peer.as_str()))
+        .unwrap_or(providers.len()));
     for target in targets.into_iter().take(4) {
         let Some(expected) = target.peer_id_hint else { continue; };
         if sessions.iter().any(|s| s.is_active && reliable(&s.protocol) && s.peer_id.as_deref() == Some(expected.as_str())) {
@@ -119,15 +126,18 @@ pub(crate) fn share_capability(native: &NativeNode, id: &str) -> Result<Value> {
     let entry = read_index(native)?.into_iter().find(|v| v["id"] == id).context("Файл не найден")?;
     anyhow::ensure!(entry["status"] != "offered", "Сначала скачайте файл");
     let mut providers = Vec::new();
-    if let Some(peer) = entry["peer"].as_str() { providers.push(peer.to_owned()); }
-    if let Some(existing) = entry["providers"].as_array() {
-        for peer in existing.iter().filter_map(Value::as_str).take(6) {
-            if !providers.iter().any(|p| p == peer) { providers.push(peer.to_owned()); }
+    let replica = replica_peer(&entry);
+    let local = native.node.peer_id();
+    let known = entry["providers"].as_array().into_iter().flatten().filter_map(Value::as_str);
+    for peer in replica.into_iter().chain(known).chain(entry["peer"].as_str()) {
+        if providers.len() == 7 { break; }
+        if peer != local && !providers.iter().any(|p| p == peer) {
+            providers.push(peer.to_owned());
         }
     }
-    providers.push(native.node.peer_id().to_owned());
+    providers.push(local.to_owned());
     Ok(json!({"id":entry["id"], "key":entry["key"], "name":entry["name"],
-        "size":entry["size"], "providers":providers,"image":entry["image"]}))
+        "size":entry["size"], "providers":providers,"image":entry["image"],"replicaPeer":replica}))
 }
 
 pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
@@ -136,11 +146,10 @@ pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
         let service = native.node.block_transfer_service().context("Хранилище недоступно")?;
         let manifest_id = content_id_from_hex(id).context("Неверный ID файла")?;
         let key = content_id_from_hex(entry["key"].as_str().context("Нет ключа файла")?).context("Неверный ключ")?;
-        let providers = entry["providers"].as_array().context("Нет источников файла")?
-            .iter().filter_map(|v| v.as_str().map(str::to_owned)).collect::<Vec<_>>();
+        entry["providers"].as_array().context("Нет источников файла")?;
         progress(json!({"busy":true,"fileId":id,"name":entry["name"],"stage":"Получение файла","done":0,"total":0}));
-        ensure_file_path(native, &providers).await?;
-        let sealed = service.fetch_from_providers(manifest_id, &providers).await?;
+        let sources = Arc::new(FileSources::open(native, &entry).await?);
+        let sealed = sources.fetch(&service, manifest_id, 0).await?;
         let manifest = FileManifest::decode(&decrypt_chunk(&key, 0, &sealed)?)?;
         anyhow::ensure!(manifest.file_size <= MAX_FILE_SIZE && manifest.chunk_ids.len() <= 400,
             "Файл превышает допустимый размер");
@@ -153,11 +162,6 @@ pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
         let mut next = 0usize;
         let mut failure: Option<anyhow::Error> = None;
         let mut pending = tokio::task::JoinSet::new();
-        let sessions = native.node.debug_sessions();
-        let connected_sources: Vec<String> = providers.iter().filter(|peer| sessions.iter().any(|s|
-            s.is_active && s.peer_id.as_ref() == Some(*peer)
-                && matches!(s.protocol.as_str(), "tcp" | "quic" | "tunnel_tcp" | "relay")))
-            .cloned().collect();
         // Keep a bounded window full. A slow chunk does not stop requests for
         // other chunks. Their original indices determine authentication and
         // the manifest determines export order, regardless of arrival order.
@@ -167,19 +171,9 @@ pub(crate) fn download(native: &NativeNode, id: &str) -> Result<Value> {
                 let block = manifest.chunk_ids[index];
                 let key = manifest.file_key;
                 let service = service.clone();
-                // Distribute across confirmed data links. An offline original
-                // sender remains a fallback, not a primary for half the chunks.
-                let mut sources = if connected_sources.len() > 1 { connected_sources.clone() }
-                    else { providers.clone() };
-                if connected_sources.len() > 1 {
-                    let offset = index % sources.len();
-                    sources.rotate_left(offset);
-                    for peer in &providers {
-                        if !sources.contains(peer) { sources.push(peer.clone()); }
-                    }
-                }
+                let sources = sources.clone();
                 pending.spawn(async move {
-                    let encrypted = service.fetch_from_providers(block, &sources).await?;
+                    let encrypted = sources.fetch(&service, block, index).await?;
                     let plain = decrypt_chunk(&key, index as u32, &encrypted)?;
                     anyhow::ensure!(plain.len() <= CHUNK_SIZE, "Часть файла превышает допустимый размер");
                     Ok::<_, anyhow::Error>((encrypted, plain.len() as u64))
@@ -238,7 +232,12 @@ pub fn begin(path: String, name: String, retry_id: String) -> Result<Value> {
             let _ = fs::remove_file(format!("{path}.preview"));
         }
         match result {
-            Ok(Ok(entry)) => progress(json!({"busy":false, "name":entry["name"], "fileId":entry["id"], "stage":"Файл сохранён на другом узле", "done":1, "total":1})),
+            Ok(Ok(entry)) => {
+                let total = ["blocks", "imageBlocks"].iter().filter_map(|field| entry[*field].as_array())
+                    .map(Vec::len).sum::<usize>() + 1;
+                progress(json!({"busy":false, "name":entry["name"], "fileId":entry["id"],
+                    "stage":"Файл сохранён на другом узле", "done":total, "total":total}));
+            }
             Ok(Err(error)) => progress(json!({"busy":false, "name":name, "error":format!("{error:#}")})),
             Err(_) => progress(json!({"busy":false, "name":name, "error":"Ошибка обработки файла"})),
         }
@@ -286,7 +285,58 @@ fn import(native: &NativeNode, path: &str, name: &str) -> Result<Value> {
     save_entry(native, entry.clone())?;
     Ok(entry)
 }
-fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
+fn publish(native: &NativeNode, entry: Value) -> Result<Value> {
+    publish_measured(native, entry, || {})
+}
+
+async fn push_replica(
+    service: &Arc<BlockTransferService>,
+    peer: &str,
+    ids: &[ContentId],
+    window: usize,
+    mut report: impl FnMut(usize),
+) -> Result<()> {
+    let mut remaining = ids.iter().copied();
+    let mut pending = tokio::task::JoinSet::new();
+    let mut failure = None;
+    let mut acknowledged = 0;
+    report(acknowledged);
+    loop {
+        while failure.is_none() && pending.len() < window {
+            let Some(id) = remaining.next() else { break; };
+            match service.store.get(&id).context("Не удалось прочитать локальный блок")
+                .and_then(|data| data.context("Локальный блок не найден")) {
+                Ok(data) => {
+                    let service = service.clone();
+                    let peer = peer.to_owned();
+                    pending.spawn(async move { service.push_to(&peer, id, data).await });
+                }
+                Err(error) => failure = Some(error),
+            }
+        }
+
+        let Some(result) = pending.join_next().await else { break; };
+        match result.map_err(anyhow::Error::from).and_then(|result| result) {
+            Ok(()) => {
+                acknowledged += 1;
+                report(acknowledged);
+            }
+            Err(error) => { failure.get_or_insert(error); }
+        }
+        // The block service removes pending replies when each send finishes.
+        // Drain the window before trying the next peer.
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+fn publish_measured(native: &NativeNode, mut entry: Value, all_acked: impl FnOnce()) -> Result<Value> {
+    let window = UPLOAD_CONCURRENCY;
+    #[cfg(test)]
+    let window = std::env::var("LP2LN_BENCH_WINDOW").map_or(window, |value| {
+        let value = value.parse().expect("Invalid upload window");
+        assert!(matches!(value, 1 | 2 | 4));
+        value
+    });
     let result = native.runtime.block_on(async {
         let service = native.node.block_transfer_service().context("Хранилище недоступно")?;
         let peers = native.node.connected_peers();
@@ -304,22 +354,22 @@ fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
         ids.push(content_id_from_hex(entry["id"].as_str().context("Missing ID")?).context("Invalid manifest ID")?);
         let mut last_error = String::new();
         // A replica means one peer acknowledged EVERY block, including the encrypted manifest.
-        for peer in peers.iter().take(3) {
-            let mut complete = true;
-            for (index, id) in ids.iter().enumerate() {
-                progress(json!({"busy":true,"name":entry["name"],"stage":"Передача в сеть","done":index,"total":ids.len()}));
-                let data = service.store.get(id)?.context("Локальный блок не найден")?;
-                if let Err(error) = service.push_to(peer.as_str(), *id, data).await {
-                    last_error = error.to_string();
-                    complete = false;
-                    break;
+        for (index, peer) in peers.iter().take(3).enumerate() {
+            let stage = if index == 0 { "Передача в сеть".to_owned() }
+                else { format!("Передача в сеть (попытка {})", index + 1) };
+            match push_replica(&service, peer.as_str(), &ids, window, |done| {
+                progress(json!({"busy":true,"name":entry["name"],"stage":stage,"done":done,"total":ids.len()}));
+            }).await {
+                Ok(()) => {
+                    all_acked();
+                    if let Some(dht) = native.node.dht_service() {
+                        progress(json!({"busy":true,"name":entry["name"],"stage":"Публикация в DHT",
+                            "done":ids.len(),"total":ids.len()}));
+                        for id in &ids { let _ = dht.announce(*id).await; }
+                    }
+                    return Ok(peer.to_string());
                 }
-            }
-            if complete {
-                if let Some(dht) = native.node.dht_service() {
-                    for id in &ids { let _ = dht.announce(*id).await; }
-                }
-                return Ok(peer.to_string());
+                Err(error) => last_error = error.to_string(),
             }
         }
         anyhow::bail!("Узлы не подтвердили сохранение. Локальная копия доступна. {last_error}")
@@ -335,6 +385,8 @@ fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
         }
         Err(error) => {
             entry["status"] = json!("local");
+            entry["replicas"] = json!(0);
+            entry["peer"] = Value::Null;
             entry["error"] = json!(error.to_string());
             save_entry(native, entry)?;
             Err(error)
@@ -372,6 +424,14 @@ fn export_from(native: &NativeNode, id: &str, destination: &str) -> Result<Value
 mod split_node_benchmark;
 
 #[cfg(test)]
+#[path = "file_transfer_benchmark.rs"]
+mod file_transfer_benchmark;
+
+#[cfg(test)]
+#[path = "file_transfer_tests.rs"]
+mod file_transfer_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -389,6 +449,12 @@ mod tests {
     }
 
     pub(super) fn test_node(directory: &Path, routed_signatures: bool) -> (NativeNode, std::net::SocketAddr) {
+        test_node_with_storage(directory, routed_signatures, true, true, 0)
+    }
+
+    pub(super) fn test_node_with_storage(
+        directory: &Path, routed_signatures: bool, content: bool, dht: bool, quota: usize,
+    ) -> (NativeNode, std::net::SocketAddr) {
         use lp2ln_core_v2::{db::P2PDatabase, node::{NodeBuilder, NodeOptions}, transport::tcp::TcpTransport};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -399,7 +465,9 @@ mod tests {
         options.lan_discovery.enabled = false;
         options.debug_server.enabled = false;
         options.ipc_tcp.enabled = false;
-        options.experimental.content = true;
+        options.experimental.content = content;
+        options.experimental.content_max_local_blocks = quota;
+        options.experimental.dht = dht;
         options.database_dir = Some(directory.to_path_buf());
         if routed_signatures {
             options.signature_format = lp2ln_core_v2::crypto::signature::SignatureFormat::V4Hash;

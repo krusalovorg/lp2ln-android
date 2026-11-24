@@ -57,6 +57,8 @@ fn received_entry(message: &Value, sender: &str) -> Result<Value> {
     anyhow::ensure!(providers.len() <= 8, "Слишком много источников");
     let mut sources: Vec<String> = providers.iter().filter_map(|v| v.as_str())
         .filter(|peer| valid_peer(peer)).map(str::to_owned).collect();
+    let replica = message["file"]["replicaPeer"].as_str()
+        .filter(|peer| sources.iter().any(|source| source == peer));
     if !sources.iter().any(|peer| peer == sender) { sources.push(sender.to_owned()); }
     sources.dedup();
     let name = message["file"]["name"].as_str().context("Нет имени файла")?
@@ -64,7 +66,7 @@ fn received_entry(message: &Value, sender: &str) -> Result<Value> {
     let image = &message["file"]["image"];
     if !image.is_null() { crate::image_preview::validate_capability(image)?; }
     Ok(json!({"id":id,"key":key,"name":name,"size":size,"providers":sources,
-        "receivedFrom":sender,"status":"offered","replicas":0,"blocks":[],"image":image}))
+        "receivedFrom":sender,"status":"offered","replicas":0,"blocks":[],"image":image,"replicaPeer":replica}))
 }
 
 pub(crate) async fn listen(node: Arc<NodeRuntime>, index: Arc<FileIndex>) {
@@ -153,6 +155,14 @@ mod tests {
         assert_eq!(entry["status"], "offered");
         assert_eq!(entry["receivedFrom"], sender.peer_id());
         assert_eq!(entry["providers"][0], sender.peer_id());
+        assert!(entry["replicaPeer"].is_null());
+        let replica = NodeKeypair::generate();
+        message["file"]["replicaPeer"] = json!(replica.peer_id());
+        assert!(received_entry(&message, sender.peer_id()).unwrap()["replicaPeer"].is_null());
+        message["file"]["providers"] = json!([replica.peer_id()]);
+        let entry = received_entry(&message, sender.peer_id()).unwrap();
+        assert_eq!(entry["replicaPeer"], replica.peer_id());
+        assert_eq!(entry["providers"], json!([replica.peer_id(), sender.peer_id()]));
         message["file"]["size"] = json!(101 * 1024 * 1024);
         assert!(received_entry(&message, sender.peer_id()).is_err());
         message["file"]["size"] = json!(42);

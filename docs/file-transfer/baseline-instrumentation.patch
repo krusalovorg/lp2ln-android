@@ -1,0 +1,29 @@
+diff --git a/rust/src/files.rs b/rust/src/files.rs
+--- a/rust/src/files.rs
++++ b/rust/src/files.rs
+@@ -289 +289,5 @@ fn import(native: &NativeNode, path: &str, name: &str) -> Result<Value> {
+-fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
++fn publish(native: &NativeNode, entry: Value) -> Result<Value> {
++    publish_measured(native, entry, || {})
++}
++
++fn publish_measured(native: &NativeNode, mut entry: Value, all_acked: impl FnOnce()) -> Result<Value> {
+@@ -318,0 +323 @@ fn publish(native: &NativeNode, mut entry: Value) -> Result<Value> {
++                all_acked();
+@@ -373,0 +379,4 @@ mod split_node_benchmark;
++#[cfg(test)]
++#[path = "file_transfer_benchmark.rs"]
++mod file_transfer_benchmark;
++
+@@ -391,0 +401,6 @@ mod tests {
++        test_node_with_storage(directory, routed_signatures, true, true, 0)
++    }
++
++    pub(super) fn test_node_with_storage(
++        directory: &Path, routed_signatures: bool, content: bool, dht: bool, quota: usize,
++    ) -> (NativeNode, std::net::SocketAddr) {
+@@ -402 +417,3 @@ mod tests {
+-        options.experimental.content = true;
++        options.experimental.content = content;
++        options.experimental.content_max_local_blocks = quota;
++        options.experimental.dht = dht;

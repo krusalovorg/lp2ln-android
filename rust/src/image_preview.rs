@@ -4,7 +4,7 @@ use lp2ln_core_v2::storage::{content_id_from_hex, content_id_hex,
     encrypt::{decrypt_chunk, encrypt_chunk, generate_key}};
 use serde_json::{json, Value};
 use std::{fs, path::Path};
-use crate::NativeNode;
+use crate::{files::file_sources::FileSources, NativeNode};
 
 pub(crate) const MAX_THUMBNAIL: usize = 24 * 1024;
 
@@ -41,15 +41,12 @@ pub(crate) fn fetch(native: &NativeNode, id: &str, destination: &str) -> Result<
     let entry = native.file_index.read()?.into_iter().find(|e| e["id"] == id).context("File not found")?;
     let capability = &entry["image"];
     validate_capability(capability)?;
-    let mut providers: Vec<String> = entry["providers"].as_array().into_iter().flatten()
-        .filter_map(|v| v.as_str().map(str::to_owned)).collect();
-    if let Some(peer) = entry["peer"].as_str() { providers.insert(0, peer.to_owned()); }
     native.runtime.block_on(async {
-        crate::files::ensure_file_path(native, &providers).await?;
+        let sources = FileSources::open(native, &entry).await?;
         let service = native.node.block_transfer_service().context("Storage unavailable")?;
         let id = content_id_from_hex(capability["id"].as_str().unwrap()).unwrap();
         let key = content_id_from_hex(capability["key"].as_str().unwrap()).unwrap();
-        let sealed = service.fetch_from_providers(id, &providers).await?;
+        let sealed = sources.fetch(&service, id, 0).await?;
         anyhow::ensure!(sealed.len() <= MAX_THUMBNAIL + 64, "Thumbnail too large");
         let bytes = decrypt_chunk(&key, 0, &sealed)?;
         jpeg(&bytes)?;
